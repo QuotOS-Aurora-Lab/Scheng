@@ -303,13 +303,9 @@ final class EventView: PetView {
         controller?.endDrag()
     }
 
-    override func rightMouseDown(with event: NSEvent) {
-        controller?.showActionMenu()
-    }
-
-    override func scrollWheel(with event: NSEvent) {
-        controller?.scrollResize(delta: event.scrollingDeltaY, precise: event.hasPreciseScrollingDeltas)
-    }
+    // 右键和滚轮都不再挂功能：
+    // 动作菜单里的每一项（说句话 / 专注 / 法条联动 / 躲藏 / 回位置）控制台和菜单栏图标都有，
+    // 留着只是让人多点一次；滚轮调大小又太容易误触——滚一下桌面就把宠物缩放了一圈。
 }
 
 // MARK: - 气泡
@@ -479,8 +475,6 @@ final class PetController: NSObject {
     private var passThrough = false
     private var alphaRepKey: String?
     private var alphaRep: NSBitmapImageRep?
-    /// 滚轮调大小累积量
-    private var scrollAccum: CGFloat = 0
     /// 专注结束的提示音。必须持有引用，否则 NSSound 可能在播完前就被释放
     private var focusChime: NSSound?
     private var blinkingUntil: CFAbsoluteTime = 0
@@ -1187,20 +1181,6 @@ final class PetController: NSObject {
         return (d, w, h)
     }
 
-    /// 滚轮调大小：一格 8px。触控板每次给的位移很小，累积到 8 才动一下，避免轻轻一划就跳到底。
-    func scrollResize(delta: CGFloat, precise: Bool) {
-        guard !dragging, !turning, !isDropping, !isFlying else { return }
-        scrollAccum += precise ? delta : delta * 16
-        guard abs(scrollAccum) >= 8 else { return }
-        let dir: CGFloat = scrollAccum > 0 ? 1 : -1
-        scrollAccum = 0
-        // 先按范围夹住再比较：到了 120/360 还继续滚的话，原来会不停 setFrame + 重绘 + 写偏好
-        let target = max(120, min(360, petSize + dir * 8))
-        guard abs(target - petSize) > 0.5 else { return }
-        lastInteractionAt = CFAbsoluteTimeGetCurrent()
-        resize(to: target)
-    }
-
     // MARK: 随机行为
 
     private func idleBehavior() {
@@ -1649,13 +1629,7 @@ final class PetController: NSObject {
         if allowTalk, Bool.random() { speakLines() }
     }
 
-    func hideAction() {
-        lastInteractionAt = CFAbsoluteTimeGetCurrent()
-        manualAction = true
-        setState(.hide)
-    }
-
-    /// 打开或关闭 Lawlearn 联动（右键菜单与控制台共用）
+    /// 打开或关闭 Lawlearn 联动
     func setLawlearnLinked(_ on: Bool) {
         UserDefaults.standard.set(on, forKey: "lawlearnLinked")
         if on {
@@ -1673,12 +1647,10 @@ final class PetController: NSObject {
     /// 测试用：验证 Lawlearn 检测与联动开关
     func testLawToggle() {
         xlog("law test: installed=\(Lawlearn.installed) linked=\(Lawlearn.linked) connected=\(Lawlearn.shared.connected)")
-        xlog("law test: menu label would be 「\(Lawlearn.installed ? "与 Lawlearn 联动" : "本机未安装 Lawlearn")」 enabled=\(Lawlearn.installed)")
-        let item = NSMenuItem(title: "t", action: nil, keyEquivalent: "")
-        menuToggleLawlearn(item)
-        xlog("law test: after off -> linked=\(Lawlearn.linked) connected=\(Lawlearn.shared.connected) menuState=\(item.state.rawValue)")
-        menuToggleLawlearn(item)
-        xlog("law test: after on -> linked=\(Lawlearn.linked) connected=\(Lawlearn.shared.connected) menuState=\(item.state.rawValue)")
+        setLawlearnLinked(false)
+        xlog("law test: after off -> linked=\(Lawlearn.linked) connected=\(Lawlearn.shared.connected)")
+        setLawlearnLinked(true)
+        xlog("law test: after on -> linked=\(Lawlearn.linked) connected=\(Lawlearn.shared.connected)")
     }
 
     /// 测试用：直接把角色抬到半空并当成“松手后悬停”
@@ -1754,107 +1726,28 @@ final class PetController: NSObject {
         window.setFrameOrigin(o)
     }
 
-    // MARK: 右键动作菜单
+    // MARK: 动作预览
 
-    /// 右键动作菜单的分组。标题尽量短——菜单宽度是按最长那一行算的，
-    /// 「与 Lawlearn 联动」这种中英混排会把整块菜单撑到 178pt 宽。
+    /// 手动播动作用的分组，控制台「动作预览」下拉就是按这个排的。
+    /// 取值和顺序沿用原右键菜单，省得改了之后找不到某个动作。
     static let actionGroups: [(String, [(String, PetState)])] = [
         ("日常", [("发呆", .daze), ("打哈欠", .yawn), ("甩尾", .tail), ("打滚", .play),
                   ("伸懒腰", .stretch), ("挥手", .wave), ("扑跳", .pounce),
-                  ("蹲起", .squat), ("睡着", .sleep), ("摸头", .pat)]),
+                  ("蹲起", .squat), ("睡着", .sleep), ("摸头", .pat),
+                  ("缩成毛球", .hide)]),
         ("学习", [("抱平板", .tablet), ("专注看书", .study), ("敲法槌", .gavel),
                   ("敲键盘", .type), ("翻页", .page), ("记笔记", .note)]),
         ("吃喝玩", [("舔毛", .groom), ("小鱼干", .fish), ("走路", .walk),
                     ("待机", .idle), ("被拎起", .lift), ("落地", .land)])
     ]
 
-    /// 构建右键菜单。抽成独立方法，弹不弹都能先拿到菜单对象（也才好量它的尺寸）。
-    func buildActionMenu() -> NSMenu {
-        let menu = NSMenu()
-        menu.autoenablesItems = false
-        for (groupTitle, items) in Self.actionGroups {
-            let parent = NSMenuItem(title: groupTitle, action: nil, keyEquivalent: "")
-            let sub = NSMenu(title: groupTitle)
-            sub.autoenablesItems = false
-            for (title, st) in items {
-                let item = NSMenuItem(title: title, action: #selector(menuPicked(_:)), keyEquivalent: "")
-                item.target = self
-                item.representedObject = st.rawValue
-                sub.addItem(item)
-            }
-            parent.submenu = sub
-            menu.addItem(parent)
-        }
-        menu.addItem(.separator())
-        let sayItem = NSMenuItem(title: "说句话", action: #selector(menuSay), keyEquivalent: "")
-        sayItem.target = self
-        menu.addItem(sayItem)
-        let hideItem = NSMenuItem(title: "躲进毛球", action: #selector(menuHide), keyEquivalent: "")
-        hideItem.target = self
-        menu.addItem(hideItem)
-        let homeItem = NSMenuItem(title: "回右下角", action: #selector(menuHome), keyEquivalent: "")
-        homeItem.target = self
-        menu.addItem(homeItem)
-        let lawItem: NSMenuItem
-        if Lawlearn.installed {
-            lawItem = NSMenuItem(title: "法条联动",
-                                 action: #selector(menuToggleLawlearn(_:)), keyEquivalent: "")
-            lawItem.target = self
-            lawItem.state = Lawlearn.linked ? .on : .off
-        } else {
-            lawItem = NSMenuItem(title: "未装 Lawlearn", action: nil, keyEquivalent: "")
-            lawItem.isEnabled = false
-            lawItem.state = .off
-        }
-        menu.addItem(lawItem)
-        menu.addItem(.separator())
-        let consoleItem = NSMenuItem(title: "控制台…", action: #selector(menuConsole), keyEquivalent: "")
-        consoleItem.target = self
-        menu.addItem(consoleItem)
-        return menu
-    }
-
-    func showActionMenu() {
+    /// 手动播一个动作。控制台的「动作预览」下拉选中哪项就走这里。
+    func playAction(_ st: PetState) {
         lastInteractionAt = CFAbsoluteTimeGetCurrent()
-        let menu = buildActionMenu()
-        // 用 context menu 的方式在指针处弹出：贴住鼠标、靠近屏幕下沿会自动向上翻。
-        // 原来是从宠物头顶往下展开，宠物站在屏幕底部，224pt 高的菜单顶出屏幕下沿，
-        // 系统只好把菜单夹回来并加上下滚动箭头——就是「展开不全、要翻」的来源。
-        if let ev = NSApp.currentEvent, ev.window === view.window,
-           ev.type == .rightMouseDown || ev.type == .leftMouseDown {
-            NSMenu.popUpContextMenu(menu, with: ev, for: view)
-            return
-        }
-        // 没有可用的鼠标事件（例如由调试开关触发）：自己算一个能完整放下整块菜单的位置。
-        menu.update()
-        let size = menu.size
-        let pet = window.frame
-        let vf = (window.screen ?? NSScreen.main)?.visibleFrame ?? pet
-        // X 默认和宠物居中对齐，Y 默认贴在宠物头顶；哪一边放不下就贴屏幕边。
-        let x = max(vf.minX + 4, min(pet.midX - size.width / 2, vf.maxX - size.width - 4))
-        var top = pet.maxY + 4
-        if top + size.height > vf.maxY { top = vf.maxY - 4 }
-        // 屏幕坐标 → 窗口坐标 → 视图坐标。view.convert(_:from: nil) 认的是窗口坐标，
-        // 直接把屏幕坐标丢进去会整体偏出窗口原点（踩过：菜单跑到屏幕外）。
-        let winPoint = window.convertFromScreen(NSRect(origin: NSPoint(x: x, y: top), size: .zero)).origin
-        let anchor = view.convert(winPoint, from: nil)
-        menu.popUp(positioning: nil, at: anchor, in: view)
-    }
-
-    @objc private func menuToggleLawlearn(_ sender: NSMenuItem) {
-        let on = !Lawlearn.linked
-        setLawlearnLinked(on)
-        sender.state = on ? .on : .off
-        xlog("lawlearn: 联动 -> \(on ? "开" : "关")  connected=\(Lawlearn.shared.connected)")
-        showBubble(on ? "已和 Lawlearn 联动" : "已取消联动", above: window.frame)
-    }
-
-    @objc private func menuPicked(_ sender: NSMenuItem) {
-        guard let raw = sender.representedObject as? String, let st = PetState(rawValue: raw) else { return }
-        lastInteractionAt = CFAbsoluteTimeGetCurrent()
-        // 手动选的动作先播完，别被定时自动行为立刻顶掉
+        // 手动选的动作先播完，别被定时的自动行为立刻顶掉
         manualHoldUntil = CFAbsoluteTimeGetCurrent() + 6
         manualAction = true
+        xlog("action: 手动播 \(st.rawValue)")
         switch st {
         case .study:
             startStudy()
@@ -1871,24 +1764,12 @@ final class PetController: NSObject {
         }
     }
 
-    @objc private func menuSay() {
-        // 原来这里写「我在专心看书」，可关掉自言自语并不等于在专注，容易看糊涂
-        guard allowTalk else { showBubble("自言自语关掉了，去控制台打开", above: window.frame); return }
-        say()
-    }
-
-    @objc private func menuHide() { hideAction() }
-
     /// 回到默认的右下角（位置会被记住，下次启动也在这儿）
-    @objc private func menuHome() {
+    func goHome() {
         lastInteractionAt = CFAbsoluteTimeGetCurrent()
         moveToDefaultPosition()
         savePosition()
         showBubble("回老位置啦", above: window.frame)
-    }
-
-    @objc private func menuConsole() {
-        NotificationCenter.default.post(name: Notification.Name("XiezhiOpenConsole"), object: nil)
     }
 
     func startStudy() {
@@ -1958,6 +1839,8 @@ final class ConsoleWindow: NSObject, NSWindowDelegate {
     private var talkCheck: NSButton!
     private var eyeCheck: NSButton!
     private var lawCheck: NSButton!
+    /// 动作预览的三个下拉（日常 / 学习 / 吃喝玩）
+    private var actionPopups: [NSPopUpButton] = []
 
     init(controller: PetController) {
         self.controller = controller
@@ -1974,27 +1857,27 @@ final class ConsoleWindow: NSObject, NSWindowDelegate {
     }
 
     private func build() {
-        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 420, height: 600),
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 420, height: 620),
                             styleMask: [.titled, .closable],
                             backing: .buffered, defer: false)
         panel.title = "Scheng · 控制台"
         panel.isReleasedWhenClosed = false
         panel.level = .floating
         panel.delegate = self
-        let content = NSView(frame: NSRect(x: 0, y: 0, width: 420, height: 600))
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: 420, height: 620))
         panel.contentView = content
 
-        content.addSubview(label("左键：拖拽 / 轻点摸头　　滚轮：调大小　　右键：选动作",
-                                 NSRect(x: 20, y: 540, width: 380, height: 18),
+        content.addSubview(label("左键：拖拽搬家 / 轻点摸头　　大小、动作、台词都在这个面板里调",
+                                 NSRect(x: 20, y: 560, width: 380, height: 18),
                                 size: 12, color: .secondaryLabelColor))
 
         // 角色大小
-        content.addSubview(label("角色大小", NSRect(x: 20, y: 502, width: 120, height: 20), size: 13, weight: .semibold))
-        sizeValue = label("", NSRect(x: 300, y: 502, width: 100, height: 20), size: 12, color: .secondaryLabelColor)
+        content.addSubview(label("角色大小", NSRect(x: 20, y: 522, width: 120, height: 20), size: 13, weight: .semibold))
+        sizeValue = label("", NSRect(x: 300, y: 522, width: 100, height: 20), size: 12, color: .secondaryLabelColor)
         sizeValue.alignment = .right
         content.addSubview(sizeValue)
         sizeSlider = NSSlider(value: 240, minValue: 120, maxValue: 360, target: self, action: #selector(sizeChanged))
-        sizeSlider.frame = NSRect(x: 20, y: 474, width: 380, height: 22)
+        sizeSlider.frame = NSRect(x: 20, y: 494, width: 380, height: 22)
         sizeSlider.isContinuous = true
         content.addSubview(sizeSlider)
 
@@ -2003,61 +1886,88 @@ final class ConsoleWindow: NSObject, NSWindowDelegate {
             let b = NSButton(title: p.0, target: self, action: #selector(presetTapped(_:)))
             b.tag = Int(p.1)
             b.bezelStyle = .rounded
-            b.frame = NSRect(x: 20 + CGFloat(i) * 96, y: 434, width: 88, height: 26)
+            b.frame = NSRect(x: 20 + CGFloat(i) * 96, y: 454, width: 88, height: 26)
             content.addSubview(b)
         }
 
         // 活动频率
-        content.addSubview(label("活动频率", NSRect(x: 20, y: 392, width: 120, height: 20), size: 13, weight: .semibold))
-        intervalValue = label("", NSRect(x: 260, y: 392, width: 140, height: 20), size: 12, color: .secondaryLabelColor)
+        content.addSubview(label("活动频率", NSRect(x: 20, y: 412, width: 120, height: 20), size: 13, weight: .semibold))
+        intervalValue = label("", NSRect(x: 260, y: 412, width: 140, height: 20), size: 12, color: .secondaryLabelColor)
         intervalValue.alignment = .right
         content.addSubview(intervalValue)
         intervalSlider = NSSlider(value: 9, minValue: 3, maxValue: 60, target: self, action: #selector(intervalChanged))
-        intervalSlider.frame = NSRect(x: 20, y: 364, width: 380, height: 22)
+        intervalSlider.frame = NSRect(x: 20, y: 384, width: 380, height: 22)
         intervalSlider.isContinuous = true
         content.addSubview(intervalSlider)
-        content.addSubview(label("数值越大越安静，3 秒最活跃、60 秒基本不动", NSRect(x: 20, y: 342, width: 380, height: 18),
+        content.addSubview(label("数值越大越安静，3 秒最活跃、60 秒基本不动", NSRect(x: 20, y: 362, width: 380, height: 18),
                                 size: 11, color: .secondaryLabelColor))
 
         // 开关
         walkCheck = NSButton(checkboxWithTitle: "允许在桌面上走动", target: self, action: #selector(walkToggled(_:)))
-        walkCheck.frame = NSRect(x: 20, y: 306, width: 380, height: 22)
+        walkCheck.frame = NSRect(x: 20, y: 326, width: 380, height: 22)
         content.addSubview(walkCheck)
 
         talkCheck = NSButton(checkboxWithTitle: "允许自言自语（含法条）", target: self, action: #selector(talkToggled(_:)))
-        talkCheck.frame = NSRect(x: 20, y: 278, width: 380, height: 22)
+        talkCheck.frame = NSRect(x: 20, y: 298, width: 380, height: 22)
         content.addSubview(talkCheck)
 
         eyeCheck = NSButton(checkboxWithTitle: "眼神跟着鼠标走", target: self, action: #selector(eyeToggled(_:)))
-        eyeCheck.frame = NSRect(x: 20, y: 250, width: 380, height: 22)
+        eyeCheck.frame = NSRect(x: 20, y: 270, width: 380, height: 22)
         content.addSubview(eyeCheck)
 
         lawCheck = NSButton(checkboxWithTitle: "与 Lawlearn 联动", target: self, action: #selector(lawLinkToggled(_:)))
-        lawCheck.frame = NSRect(x: 20, y: 222, width: 380, height: 22)
+        lawCheck.frame = NSRect(x: 20, y: 242, width: 380, height: 22)
         content.addSubview(lawCheck)
 
         // 法条占比
-        content.addSubview(label("法条台词占比", NSRect(x: 20, y: 190, width: 140, height: 20), size: 13, weight: .semibold))
-        lawValue = label("", NSRect(x: 260, y: 190, width: 140, height: 20), size: 12, color: .secondaryLabelColor)
+        content.addSubview(label("法条台词占比", NSRect(x: 20, y: 210, width: 140, height: 20), size: 13, weight: .semibold))
+        lawValue = label("", NSRect(x: 260, y: 210, width: 140, height: 20), size: 12, color: .secondaryLabelColor)
         lawValue.alignment = .right
         content.addSubview(lawValue)
         lawSlider = NSSlider(value: 40, minValue: 0, maxValue: 100, target: self, action: #selector(lawChanged))
-        lawSlider.frame = NSRect(x: 20, y: 162, width: 380, height: 22)
+        lawSlider.frame = NSRect(x: 20, y: 182, width: 380, height: 22)
         lawSlider.isContinuous = true
         content.addSubview(lawSlider)
-        content.addSubview(label("连着 Lawlearn 时，说话有多大比例是念法条", NSRect(x: 20, y: 140, width: 380, height: 18),
+        content.addSubview(label("连着 Lawlearn 时，说话有多大比例是念法条", NSRect(x: 20, y: 160, width: 380, height: 18),
                                 size: 11, color: .secondaryLabelColor))
+
+        // 动作预览：原来右键菜单里的那三组动作挪到这儿。
+        // 三组各一个小下拉，比一整条 22 项的长菜单好点——每个最多 10 项，不用滚动。
+        content.addSubview(label("动作预览", NSRect(x: 20, y: 124, width: 80, height: 20), size: 13, weight: .semibold))
+        actionPopups = []
+        for (i, group) in PetController.actionGroups.enumerated() {
+            let pop = NSPopUpButton(frame: NSRect(x: 104 + CGFloat(i) * 98, y: 94, width: 92, height: 26),
+                                    pullsDown: false)
+            pop.bezelStyle = .rounded
+            pop.font = NSFont.systemFont(ofSize: 12)
+            pop.addItem(withTitle: group.0)
+            pop.menu?.addItem(.separator())
+            for (title, st) in group.1 {
+                let item = NSMenuItem(title: title, action: #selector(actionChosen(_:)), keyEquivalent: "")
+                item.target = self
+                item.tag = i
+                item.representedObject = st.rawValue
+                pop.menu?.addItem(item)
+            }
+            // 第一项只是组名，不能点。autoenablesItems 必须关掉，
+            // 否则菜单一弹出 AppKit 会按 target 校验把 isEnabled=false 又改回 true（踩过）。
+            pop.menu?.autoenablesItems = false
+            pop.item(at: 0)?.isEnabled = false
+            pop.selectItem(at: 0)
+            actionPopups.append(pop)
+            content.addSubview(pop)
+        }
 
         // 快捷操作
         for (i, t) in ["让它说句话", "专注 25 分钟", "结束专注"].enumerated() {
             let b = NSButton(title: t, target: self, action: #selector(quickAction(_:)))
             b.tag = i
             b.bezelStyle = .rounded
-            b.frame = NSRect(x: 20 + CGFloat(i) * 128, y: 96, width: 118, height: 28)
+            b.frame = NSRect(x: 20 + CGFloat(i) * 128, y: 58, width: 118, height: 28)
             content.addSubview(b)
         }
 
-        content.addSubview(label("设置会自动保存，下次启动沿用", NSRect(x: 20, y: 60, width: 380, height: 18),
+        content.addSubview(label("设置会自动保存，下次启动沿用", NSRect(x: 20, y: 26, width: 380, height: 18),
                                 size: 11, color: .tertiaryLabelColor))
 
         window = panel
@@ -2174,6 +2084,17 @@ final class ConsoleWindow: NSObject, NSWindowDelegate {
         default: controller?.stopStudy()
         }
     }
+
+    /// 动作预览下拉里选了一项
+    @objc private func actionChosen(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let st = PetState(rawValue: raw) else { return }
+        controller?.playAction(st)
+        // 选完把下拉退回组名：按钮上常驻组名比显示某个动作更好认，也不会显得「卡在某一项」
+        if sender.tag >= 0, sender.tag < actionPopups.count {
+            actionPopups[sender.tag].selectItem(at: 0)
+        }
+    }
 }
 
 // MARK: - App
@@ -2190,9 +2111,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Lawlearn.shared.connect()
         console = ConsoleWindow(controller: controller)
         setupMenuBar()
-        NotificationCenter.default.addObserver(forName: Notification.Name("XiezhiOpenConsole"), object: nil, queue: .main) { [weak self] _ in
-            self?.console.show()
-        }
         // 调试用：XIEZHI_AUTO_SAY=1 时启动 2 秒后自动说一句（便于验收气泡排版）
         if ProcessInfo.processInfo.environment["XIEZHI_OPEN_CONSOLE"] == "1" {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
@@ -2243,11 +2161,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if ProcessInfo.processInfo.environment["XIEZHI_TEST_FLY"] == "1" {
             DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
                 self?.controller.testFly()
-            }
-        }
-        if ProcessInfo.processInfo.environment["XIEZHI_SHOW_MENU"] == "1" {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-                self?.controller.showActionMenu()
             }
         }
         if ProcessInfo.processInfo.environment["XIEZHI_AUTO_SAY"] == "1" {
@@ -2320,6 +2233,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ("专注 25 分钟看书", #selector(startStudy), ""),
             ("结束专注", #selector(stopStudy), ""),
             ("让它说句话", #selector(speak), ""),
+            ("回到右下角", #selector(goHome), ""),
             ("显示 / 隐藏 Scheng", #selector(toggleVisible), ""),
             ("退出", #selector(quit), "q")
         ]
@@ -2349,6 +2263,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func startStudy() { controller.startStudy() }
     @objc func stopStudy() { controller.stopStudy() }
     @objc func toggleVisible() { controller.toggleVisible() }
+    @objc func goHome() { controller.goHome() }
     @objc func speak() { controller.say() }
     @objc func quit() { NSApp.terminate(nil) }
 
