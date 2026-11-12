@@ -77,20 +77,34 @@ enum Catalog {
 final class Assets {
     static let shared = Assets()
     private var cache: [String: NSImage] = [:]
+    private var missing: Set<String> = []
     private let root: String
+    /// 视频清单只在首次访问时列一次目录，避免 12Hz 主循环里反复做 fileExists
+    private lazy var videoMap: [String: URL] = {
+        let dir = root + "/video"
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir) else { return [:] }
+        var map: [String: URL] = [:]
+        for name in names where name.hasSuffix(".mov") {
+            map[(name as NSString).deletingPathExtension] = URL(fileURLWithPath: dir + "/" + name)
+        }
+        return map
+    }()
 
     init() {
         root = (Bundle.main.resourcePath ?? "") + "/assets"
         let fm = FileManager.default
         let subs = (try? fm.contentsOfDirectory(atPath: root)) ?? []
-        xlog("assets root=\(root) folders=\(subs.count) \(subs.sorted().joined(separator: ","))")
         xlog("assets root=\(root) folders=\(subs.count)")
         Catalog.load(root: root)
     }
 
     func image(_ relative: String) -> NSImage? {
         if let c = cache[relative] { return c }
-        guard let img = NSImage(contentsOfFile: root + "/" + relative) else { return nil }
+        guard !missing.contains(relative) else { return nil }
+        guard let img = NSImage(contentsOfFile: root + "/" + relative) else {
+            missing.insert(relative)
+            return nil
+        }
         cache[relative] = img
         return img
     }
@@ -99,16 +113,13 @@ final class Assets {
         anim.files.compactMap { image(anim.folder + "/" + $0) }
     }
 
+    /// 末帧静图也走同一份缓存：拖动时每个 tick 都会取，不能每次重新读盘
     func endImage(_ name: String) -> NSImage? {
-        let path = root + "/end/" + name + ".png"
-        guard FileManager.default.fileExists(atPath: path) else { return nil }
-        return NSImage(contentsOfFile: path)
+        image("end/" + name + ".png")
     }
 
     func videoURL(_ name: String) -> URL? {
-        let path = root + "/video/" + name + ".mov"
-        guard FileManager.default.fileExists(atPath: path) else { return nil }
-        return URL(fileURLWithPath: path)
+        videoMap[name]
     }
 }
 
@@ -398,6 +409,7 @@ final class PetController: NSObject {
     private var velX: CGFloat = 0
     private var velY: CGFloat = 0
     private var flyStartedAt: CFAbsoluteTime = 0
+    private var lastPhysicsAt: CFAbsoluteTime = 0
     private var flyTraceCount = 0
     private var isSuspended = false
     private var suspendedSince: CFAbsoluteTime = 0
@@ -557,7 +569,16 @@ final class PetController: NSObject {
         } else {
             anim = Catalog.anims[newState] ?? Catalog.anims[.idle] ?? Catalog.fallbackIdle
         }
-        frames = Assets.shared.frames(anim)
+        // 有视频的状态不走 PNG 序列帧，帧表只用于计时和末帧兜底。
+        // 原来整组加载（打字/翻页等 150 帧）会在主线程同步读 150 个文件。
+        // 保留首帧，兼容 finishWithTurn 里 frames.first 的兜底路径。
+        if Assets.shared.videoURL(newState.rawValue) == nil {
+            frames = Assets.shared.frames(anim)
+        } else if let first = Assets.shared.image(anim.folder + "/" + (anim.files.first ?? "")) {
+            frames = [first]
+        } else {
+            frames = []
+        }
         if newState != .walk { faceRight = false }
         updateImage()
     }
@@ -659,7 +680,7 @@ final class PetController: NSObject {
         if turning { return }
         // 拖动时窗口每帧都在移动，视频层跟着移动会闪；改用静态“被拎起”画面
         if (dragging || isDropping), let liftStill = Assets.shared.endImage("lift") {
-            avPlayer?.pause()
+            pauseVideoIfPlaying()
             showStill(liftStill)
             return
         }
@@ -671,7 +692,9 @@ final class PetController: NSObject {
             return
         }
         if let still = staticOverrideImage() {
-            avPlayer?.pause()
+            // 只在播放器还在走时暂停一次；原来每个 tick 都 pause()，
+            // 会让 HEVC 解码器反复停/启，出现可见掉帧
+            pauseVideoIfPlaying()
             showStill(still)
             return
         }
@@ -827,9 +850,21 @@ final class PetController: NSObject {
         CATransaction.commit()
     }
 
+    /// 已暂停就别再发一次 pause()：12Hz 主循环里重复暂停会让解码器反复停/启
+    private func pauseVideoIfPlaying() {
+        guard let player = avPlayer, player.rate != 0 else { return }
+        player.pause()
+    }
+
     private func applyVideoMirror() {
         guard let layer = videoLayer else { return }
-        layer.setAffineTransform(faceRight ? CGAffineTransform(scaleX: -1, y: 1) : .identity)
+        let wanted = faceRight ? CGAffineTransform(scaleX: -1, y: 1) : .identity
+        let cur = layer.affineTransform()
+        // 12Hz 主循环里每 tick 都写 transform 会白白触发一次 CA 提交
+        if abs(cur.a - wanted.a) < 0.0001, abs(cur.b - wanted.b) < 0.0001,
+           abs(cur.c - wanted.c) < 0.0001, abs(cur.d - wanted.d) < 0.0001,
+           abs(cur.tx - wanted.tx) < 0.0001, abs(cur.ty - wanted.ty) < 0.0001 { return }
+        layer.setAffineTransform(wanted)
     }
 
     private func randomBlink() {
@@ -1153,6 +1188,7 @@ final class PetController: NSObject {
         stopFlying(landed: false, silent: true)
         isFlying = true
         flyStartedAt = CFAbsoluteTimeGetCurrent()
+        lastPhysicsAt = flyStartedAt
         velX = vx
         velY = vy
         flyScreen = window.screen ?? NSScreen.main
@@ -1182,7 +1218,10 @@ final class PetController: NSObject {
 
     private func physicsStep() {
         guard isFlying else { return }
-        let dt: CGFloat = 1.0 / 60.0
+        // 用真实经过时间推进：Timer 掉帧时不再变成慢动作，卡顿时也不会一次跳很远
+        let nowPhysics = CFAbsoluteTimeGetCurrent()
+        let dt: CGFloat = min(1.0 / 30.0, max(1.0 / 240.0, CGFloat(nowPhysics - lastPhysicsAt)))
+        lastPhysicsAt = nowPhysics
         let gravity: CGFloat = 900          // pt/s²
         let maxSeconds: CFAbsoluteTime = 9  // 兜底，别一直弹
 
@@ -1552,7 +1591,7 @@ final class ConsoleWindow: NSObject, NSWindowDelegate {
         let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 420, height: 600),
                             styleMask: [.titled, .closable],
                             backing: .buffered, defer: false)
-        panel.title = "獬豸 · 控制台"
+        panel.title = "Scheng · 控制台"
         panel.isReleasedWhenClosed = false
         panel.level = .floating
         panel.delegate = self
@@ -1873,7 +1912,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ("专注 25 分钟看书", #selector(startStudy), ""),
             ("结束专注", #selector(stopStudy), ""),
             ("让它说句话", #selector(speak), ""),
-            ("显示 / 隐藏獬豸", #selector(toggleVisible), ""),
+            ("显示 / 隐藏 Scheng", #selector(toggleVisible), ""),
             ("退出", #selector(quit), "q")
         ]
         for (title, sel, key) in items {

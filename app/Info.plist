@@ -3,15 +3,17 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>獬豸桌宠</string>
+    <string>Scheng</string>
     <key>CFBundleDisplayName</key>
-    <string>獬豸桌宠</string>
+    <string>Scheng</string>
     <key>CFBundleIdentifier</key>
     <string>com.suzukihnnn.xiezhi-pet</string>
     <key>CFBundleExecutable</key>
     <string>XiezhiPet</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon.icns</string>
     <key>CFBundleShortVersionString</key>
     <string>0.1.0</string>
     <key>CFBundleVersion</key>

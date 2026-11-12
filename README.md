@@ -1,4 +1,4 @@
-# 獬豸桌宠（xiezhi_pet）
+# Scheng
 
 法学学生 OC「獬豸」的 macOS 原生桌宠：AppKit 无边框 NSPanel + 512×512 透明底序列帧 + 菜单栏天平图标。
 
@@ -10,7 +10,7 @@ raw/         全部生成原图（绿幕四格 / 白底单图）+ 切片中间�
 assets/      最终帧，按动作分文件夹（01_idle … 20_fish）+ sequence.json + 预览图
 scripts/     pipeline.py（去底/裁边/统一画布/填洞）、build_assets.py（批量构建）
 app/         Sources/main.swift、Info.plist、build.sh、Resources_icon_scale_black.png
-build/       獬豸桌宠.app + 獬豸桌宠.app.zip
+build/       Scheng.app + Scheng.app.zip
 ```
 
 ## 素材现状
@@ -64,9 +64,9 @@ build/       獬豸桌宠.app + 獬豸桌宠.app.zip
 ## 构建与运行
 
 ```bash
-cd app && ./build.sh          # 重建 build/獬豸桌宠.app（含 assets 同步与 ad-hoc 签名）
-pkill -9 -f XiezhiPet; open ../build/獬豸桌宠.app
-cd build && ditto -c -k --sequesterRsrc --keepParent 獬豸桌宠.app 獬豸桌宠.app.zip
+cd app && ./build.sh          # 重建 build/Scheng.app（含 assets 同步与 ad-hoc 签名）
+pkill -9 -f XiezhiPet; open ../build/Scheng.app
+cd build && ditto -c -k --sequesterRsrc --keepParent Scheng.app Scheng.app.zip
 ```
 
 调试用环境变量：`XIEZHI_AUTO_SAY=1`（启动 2 秒后自动说一句）、`XIEZHI_SAY_LEGAL=1`（强制念法条）、`XIEZHI_DUMP_BUBBLE=<路径>`（把气泡离屏渲染成 PNG，因为本机截不到 NSPanel）。
