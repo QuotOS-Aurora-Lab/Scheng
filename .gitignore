@@ -1,6 +1,7 @@
-# 本仓库是「完整快照」基线，故意把 raw/、assets_512/、build_frames/、build/
-# 全部纳入版本控制，保证任何一次回退都能原样还原原图、中间件与已构建成品。
-# 这里只忽略系统运行时会自动重建的噪音文件。
+# 本仓库以「完整快照」为基线：raw/、assets_512/、build_frames/ 都纳入版本控制，
+# 保证任何一次回退都能原样还原原图与中间件。
+# 唯一例外是构建产物 build/ —— 它只是 app/build.sh 的输出，随时可以用源码重建，
+# 所以从 d6f33fb 起不再纳入版本控制。
 .DS_Store
 **/.DS_Store
 __MACOSX/
@@ -8,3 +9,6 @@ __MACOSX/
 .Trashes/
 *.swp
 *~
+
+# 构建产物：app/build.sh 生成，可随时重建
+/build/
