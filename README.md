@@ -1,22 +1,24 @@
 # Scheng
 
-法学学生 OC「獬豸」的 macOS 原生桌宠：AppKit 无边框 NSPanel + 512×512 透明底序列帧 + 菜单栏天平图标。
+法学学生 OC「獬豸」的 macOS 原生桌宠：AppKit 无边框 NSPanel + 320×320 HEVC alpha 透明视频 + 菜单栏天平图标。
 
 ## 目录
 
 ```
 refs/        两张带字原稿（身份参考）
 raw/         全部生成原图（绿幕四格 / 白底单图）+ 切片中间件 + 图标源
-assets/      最终帧，按动作分文件夹（01_idle … 20_fish）+ sequence.json + 预览图
+assets/      24 段视频（video/）+ 24 张首帧静图（still/）+ 末帧静图（end/）
+             + sequence.json + 编号序列帧目录（重建素材时才用）
+assets_512/  512×512 序列帧，视频编码源（仓库里暂无生成脚本）
 scripts/     pipeline.py（去底/裁边/统一画布/填洞）、build_assets.py（批量构建）
-app/         Sources/main.swift、Info.plist、build.sh、Resources_icon_scale_black.png
-build/       Scheng.app + Scheng.app.zip
+app/         Sources/main.swift、Info.plist、build.sh、AppIcon.icns、AppIcon-1024.png
+build/       Scheng.app（构建产物；.app.zip 默认不再生成）
 ```
 
 ## 素材现状
 
-- **20 个状态、180 帧**，全部 512×512、透明底、无文字；帧表由 `assets/sequence.json` 描述（folder / files / fps / loop / hold）。
-- 动作：待机、眨眼、被拎起、落地、走路、摸头、发呆、哈欠、甩尾、抱平板、专注看书、打滚、左右瞟、躲藏、伸懒腰、睡着、挥手、蓄势扑跳、敲法槌、舔毛、吃小鱼干。
+- **24 个状态**，每个状态一段 320×320 HEVC alpha 视频 + 一张 320×320 首帧静图，透明底、无文字；帧表由 `assets/sequence.json` 描述（folder / files / fps / loop / hold / speed），各状态 files 数量 5～150 不等。
+- 动作：待机、眨眼、被拎起、落地、走路、摸头、发呆、哈欠、甩尾、抱平板、专注看书、打滚、左右瞟、躲藏、伸懒腰、睡着、挥手、蓄势扑跳、敲法槌、舔毛、吃小鱼干、打字、翻页、记笔记、蹲起。
 - **中割帧**：每个相邻关键帧之间插一帧（命名 `*_m`，轻微位移 + 0.985 压缩），fps 按「动作总时长不变」自动换算。
 - **躲藏组**已整组重画：探出 → 露脸 → 露眼 → 缩成浅紫毛球（旧版黑毛团穿模帧已删除）。
 - **内部透明洞填充**（`pipeline.fill_internal_holes`）：把被主体包围的透明小洞填实，修掉后腿爪垫「透出桌面」的穿模问题；183 帧全检 0 残留。
@@ -25,9 +27,12 @@ build/       Scheng.app + Scheng.app.zip
 
 - 原生 Swift/AppKit，`LSUIElement=true`（无 Dock 图标），菜单栏用**天平图标**（`Resources_icon_scale_black.png`，template 随明暗自适应）。
 - 帧表数据驱动：启动读 `assets/sequence.json`，加帧不用改 Swift 代码。
-- 交互：**左键**拖拽 → 拎起，松手 → 落地，轻点（位移 < 6px）→ 摸头；**右键** → 动作菜单（日常 / 学习 / 吃喝玩 三个子菜单，外加说句话、躲进毛球、打开控制台）。
+- 交互：**左键**拖拽 → 拎起，松手 → 落地，轻点（位移 < 6px）→ 摸头；**右键** → 动作菜单（日常 / 学习 / 吃喝玩 三个子菜单，外加说句话、躲进毛球、回到右下角、打开控制台）；**滚轮**在它身上滚 → 调大小（一格 8px，120–360）。
+- **透明区点击穿透**：素材是 320×320 方图，角色只占中间一块，四角是大片纯透明。鼠标停在这些透明像素上时窗口会把 `ignoresMouseEvents` 打开，点击落到下面的桌面/窗口，不会误抓宠物。判定在 12Hz 主循环里自绘轮询（读当前状态首帧的 alpha 位图），不依赖全局鼠标监听；拖动/落地/弹跳/转身期间一律关闭，避免抢不到鼠标事件。调试：`XIEZHI_PASS_LOG=1` 打印每次穿透状态切换。
+- **记住位置**：走完一段路、拖拽松手、退出应用时把坐标写进 `UserDefaults`（`lastX`/`lastY`），下次启动放回原处；那块屏要是拔了，检测到不在任何屏幕可见区就回默认的右下角。控制台窗口同理（`consoleX`/`consoleY`），挪过就不再每次强制居中。
+- **隐藏时不起气泡**：气泡是独立窗口，宠物被藏起来时如果还弹气泡，就成了「看不见宠物却飘着一句话」。所有气泡都走 `showBubble()`，窗口不可见时直接不弹。
 - 每 9 秒随机行为（走路 / 发呆 / 哈欠 / 甩尾 / 打滚 / 伸懒腰 / 挥手 / 扑跳 / 敲法槌 / 舔毛 / 吃小鱼干 / 说话）；95 秒无互动进入睡着。
-- 专注看书 25 分钟：完全静止，不游走、不眨眼、不做眼神跟随。
+- 专注看书 25 分钟：完全静止，不游走、不眨眼、不做眼神跟随。到点会响一声系统提示音（Glass）并弹气泡——宠物可能正被别的窗口挡住，只有气泡容易被漏看。
 - **台词**：内置 13 句；检测到 `~/Library/Application Support/lawlearn/lawlearn.db` 即连接 Lawlearn，约四成概率念一条真实短条文（`民法典·第二条：……`），只读打开，不写库。
 
 ## 控制台（菜单栏左键点天平图标）
@@ -56,17 +61,29 @@ build/       Scheng.app + Scheng.app.zip
 
 - 每个状态一段 `.mov`（HEVC 带 alpha 通道，AVFoundation 原生透明播放），放在 `assets/video/<state>.mov`，首帧静帧放在 `assets/still/<state>.png`（切换瞬间兜底，不会黑帧）。
 - 待机是 **60 帧 @ 30fps**（呼吸周期 2 秒），比之前的 PNG 序列（24 帧 12fps）顺一倍多。
-- 体积：20 段视频合计约 8.6MB（HEVC alpha 约 7–11KB/帧，是 ProRes 4444 的 1/20，GIF 会丢 alpha 只能用 1bit）。
-- 重新生成：`scripts/videncl.swift` 是编码器（`videncl <fps> <out.mov> <frames...>`），从 `assets_512/<folder>` 的 PNG 序列编码。
+- 体积：24 段视频合计约 8.1MB（HEVC alpha 约 7–11KB/帧，是 ProRes 4444 的 1/20，GIF 会丢 alpha 只能用 1bit）。
+- 重新生成：`scripts/videncl.swift` 是编码器（`videncl <fps> <out.mov> <frames...>`），从 `assets_512/<folder>` 的 PNG 序列编码。注意当前成品实测为 320×320，与 `assets_512/` 的 512×512 不一致，重编码前需确认缩放步骤。
 - 眨眼与眼神跟随仍用静态图覆盖（视频层 hide、静态层显示），所以这两个交互没受影响。
-- 一次性动作（被拎起/落地/摸头/挥手/敲槌等）只播一遍，播完由  的末帧静图接管画面——所以按住不动时会稳稳停在“被拎起”的姿势，不会循环摆动；松手才播落地。
+- 一次性动作（被拎起/落地/摸头/挥手/敲槌等）只播一遍，播完由 `assets/end/<state>.png` 的末帧静图接管画面——所以按住不动时会稳稳停在“被拎起”的姿势，不会循环摆动；松手才播落地。
+
+## 流畅度与开销
+
+- **走路**：走路期间才起一个 60Hz 定时器，按真实经过时间位移（16.8 pt/s），走完立刻销毁，平时不额外耗电。原来在 12Hz 主循环里每拍挪固定 1.4pt，是「一格一格」地蹭，Timer 掉一拍还会整体变慢。
+- **窗口位置只存整点**（这个坑记一下）：`window.setFrameOrigin` 写入 1249.715，读回来是 1249.000。所以不能拿 `window.frame.origin` 当累加器——小数每步都被截掉，很小的步进会被截成整整 1pt，实际速度翻好几倍。现在另存一个带小数的 `walkAnchorX`，窗口只负责显示。
+- **主循环 12Hz** 只做渲染和状态判断；帧推进用累积时间余数（并按 `sequence.json` 的 `speed` 缩放），不再因为「这一拍不够一帧」而丢掉余数。
+- **法条台词异步取**：`ORDER BY random()` 要扫一遍 paragraphs 全表，放主线程会卡住一两百毫秒（表现为气泡弹出瞬间掉帧）。现在整条链路放后台队列，气泡晚 0.1 秒出现，但画面不顿；回包过期就用令牌丢掉。
+- **弹跳边界缓存 0.3 秒**：`playBounds()` 在 60Hz 物理里每帧都调，每次都要向 WindowServer 取 `NSScreen.screens` 再算两遍 map；屏幕参数变化时会被立刻作废。
+- **气泡淡入 0.14s / 淡出 0.22s**，原来是硬切进出；气泡会跟着宠物走动/被拖动而挪（平移用 `display: false`，不重绘文字），并且整块夹在屏幕可见区内（原来贴到屏幕左右边缘时 x 会算成负数，半截跑到屏幕外）。
+- **隐藏时不再解码**：`orderOut` 之后 AVPlayer 不会自己停，藏在菜单里一整天就等于解码一整天。现在 `render()` 发现窗口不可见就 `pause()` 直接收手；重新显示后的下一拍由 `playVideoIfNeeded` 自动恢复（实测隐藏时 `rate` 1.0→0.0，显示后回到 1.0）。
+- **定时器容差**：主循环 12Hz 给 30ms、随机行为给 `min(2s, 间隔×0.2)`、眨眼给 0.8s，让系统把多次唤醒合并；帧推进本来就按真实 dt 走，被推迟不影响动画节奏。
 
 ## 构建与运行
 
 ```bash
-cd app && ./build.sh          # 重建 build/Scheng.app（含 assets 同步与 ad-hoc 签名）
+cd app && ./build.sh          # 重建 build/Scheng.app（含 assets 同步、ad-hoc 签名与签名校验）
 pkill -9 -f XiezhiPet; open ../build/Scheng.app
-cd build && ditto -c -k --sequesterRsrc --keepParent Scheng.app Scheng.app.zip
+# 如需分发 zip（构建脚本默认不生成）：
+# cd build && ditto -c -k --sequesterRsrc --keepParent Scheng.app Scheng.app.zip
 ```
 
 调试用环境变量：`XIEZHI_AUTO_SAY=1`（启动 2 秒后自动说一句）、`XIEZHI_SAY_LEGAL=1`（强制念法条）、`XIEZHI_DUMP_BUBBLE=<路径>`（把气泡离屏渲染成 PNG，因为本机截不到 NSPanel）。

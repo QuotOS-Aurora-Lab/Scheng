@@ -33,7 +33,9 @@ enum Catalog {
     static var hideWaitFile = "hide_02.png"
 
     static var fallbackIdle: Animation {
-        Animation(folder: "01_idle", files: ["idle_01.png", "idle_02.png", "idle_03.png"], fps: 3.2, loop: true, hold: 0)
+        // still/idle.png 一定随 App 打包；帧表读取失败时用它兜底，避免白屏。
+        // 原来写的 idle_01.png 等三位/两位混用文件名在 assets/01_idle 里并不存在。
+        Animation(folder: "still", files: ["idle.png"], fps: 1.0, loop: true, hold: 0)
     }
 
     /// 从 assets/sequence.json 读取帧表（构建脚本生成，帧数/中割帧自动生效）
@@ -144,18 +146,25 @@ enum Lines {
     static let focusStart = "专注模式开始，25 分钟看书"
     static let focusEnd = "休息一下，打个滚！"
 
-    /// 随机台词：连上 Lawlearn 时约四成概率念一条真法条
-    static func next() -> String {
-        if ProcessInfo.processInfo.environment["XIEZHI_SAY_LEGAL"] == "1",
-           let article = Lawlearn.shared.randomArticle() {
-            return article
-        }
+    /// 随机台词：连上 Lawlearn 时约四成概率念一条真法条。
+    /// 法条查询是 paragraphs 全表扫 + ORDER BY random()，在主线程做会卡住
+    /// 12Hz 主循环一两百毫秒（表现就是气泡弹出来时掉帧），所以整条链路异步。
+    /// 台词本身要等不到就不弹气泡——宁可晚 0.1 秒，也不要让画面顿一下。
+    static func next(_ completion: @escaping (String) -> Void) {
+        let forced = ProcessInfo.processInfo.environment["XIEZHI_SAY_LEGAL"] == "1"
         let ratio = (UserDefaults.standard.object(forKey: "lawRatio") as? Double) ?? 0.4
-        if Lawlearn.shared.connected, Lawlearn.linked, Double.random(in: 0..<1) < ratio,
-           let article = Lawlearn.shared.randomArticle() {
-            return article
+        let wantsLegal = forced || (Lawlearn.shared.connected && Lawlearn.linked
+                                    && Double.random(in: 0..<1) < ratio)
+        guard wantsLegal else {
+            completion(speech.randomElement() ?? "")
+            return
         }
-        return speech.randomElement() ?? ""
+        DispatchQueue.global(qos: .userInitiated).async {
+            let article = Lawlearn.shared.randomArticle()
+            DispatchQueue.main.async {
+                completion(article ?? speech.randomElement() ?? "")
+            }
+        }
     }
 }
 
@@ -184,8 +193,15 @@ final class Lawlearn {
     }
     private(set) var connected = false
     private var db: OpaquePointer?
+    /// 数据库句柄只在这条串行队列上碰：查询挪到后台后，不能和 connect/close 并发
+    private let dbQueue = DispatchQueue(label: "com.suzukihnnn.xiezhi-pet.lawlearn")
 
-    func connect() {
+    func connect() { dbQueue.sync { connectLocked() } }
+    func close() { dbQueue.sync { closeLocked() } }
+    /// 随机挑一条短条文，返回「民法典·第二条：……」
+    func randomArticle() -> String? { dbQueue.sync { randomArticleLocked() } }
+
+    private func connectLocked() {
         guard FileManager.default.fileExists(atPath: Lawlearn.dbPath) else {
             xlog("lawlearn: 没找到数据库，法条台词关闭")
             return
@@ -201,14 +217,13 @@ final class Lawlearn {
         }
     }
 
-    func close() {
+    private func closeLocked() {
         if let db { sqlite3_close(db) }
         db = nil
         connected = false
     }
 
-    /// 随机挑一条短条文，返回「民法典·第二条：……」
-    func randomArticle() -> String? {
+    private func randomArticleLocked() -> String? {
         guard let db else { return nil }
         let sql = """
         SELECT l.short_name, a.label, replace(p.text, char(10), '')
@@ -291,6 +306,10 @@ final class EventView: PetView {
     override func rightMouseDown(with event: NSEvent) {
         controller?.showActionMenu()
     }
+
+    override func scrollWheel(with event: NSEvent) {
+        controller?.scrollResize(delta: event.scrollingDeltaY, precise: event.hasPreciseScrollingDeltas)
+    }
 }
 
 // MARK: - 气泡
@@ -299,6 +318,11 @@ final class BubblePanel: NSPanel {
     private let label = NSTextField(labelWithString: "")
     private let box = NSView()
     private var hideTimer: Timer?
+    /// 每次 show 自增：淡出动画和延时的 orderOut 都可能在新气泡弹出之后才回来
+    private var showToken = 0
+    /// 气泡当前挂在哪块位置上，宠物走动时用来跟着挪
+    private var anchorPet: NSRect = .zero
+    private var bubbleSize = NSSize.zero
 
     init() {
         super.init(contentRect: NSRect(x: 0, y: 0, width: 320, height: 46),
@@ -351,8 +375,22 @@ final class BubblePanel: NSPanel {
             cell.wraps = true
             cell.isScrollable = false
         }
-        setFrame(NSRect(x: petFrame.midX - w / 2, y: petFrame.maxY - 30, width: w, height: h), display: true)
+        bubbleSize = NSSize(width: w, height: h)
+        anchorPet = petFrame
+        layoutBubble(petFrame)
+        showToken &+= 1
+        let token = showToken
+        // 淡入：原来直接 orderFront 是硬切，视觉上「啪」一下
+        let wasVisible = isVisible && alphaValue > 0.95
+        if !wasVisible { alphaValue = 0 }
         orderFrontRegardless()
+        if !wasVisible {
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.14
+                ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                animator().alphaValue = 1
+            }
+        }
 
         // 验收用：XIEZHI_DUMP_BUBBLE=<路径> 时把气泡离屏渲染成 PNG（本机截不到 NSPanel）
         if let path = ProcessInfo.processInfo.environment["XIEZHI_DUMP_BUBBLE"] {
@@ -369,8 +407,38 @@ final class BubblePanel: NSPanel {
         let seconds = min(10.0, 2.6 + Double(text.count) * 0.16)
         hideTimer?.invalidate()
         hideTimer = Timer.scheduledTimer(withTimeInterval: seconds, repeats: false) { [weak self] _ in
-            self?.orderOut(nil)
+            guard let self, self.showToken == token else { return }
+            NSAnimationContext.runAnimationGroup({ ctx in
+                ctx.duration = 0.22
+                ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
+                self.animator().alphaValue = 0
+            }, completionHandler: { [weak self] in
+                guard let self, self.showToken == token else { return }
+                self.orderOut(nil)
+                self.alphaValue = 1
+            })
         }
+    }
+
+    /// 宠物走动或被拖走时气泡跟着挪，别把它留在原地飘着
+    func follow(_ petFrame: NSRect) {
+        guard isVisible, bubbleSize != .zero, !petFrame.equalTo(anchorPet) else { return }
+        anchorPet = petFrame
+        // display: false —— 内容没变，只是整块窗口平移，不需要每步重绘文字
+        layoutBubble(petFrame, display: false)
+    }
+
+    /// 定位：默认浮在宠物头顶，但整块气泡必须留在屏幕可见区内
+    /// （原来贴到屏幕左/右边缘时 x 会算成负数，气泡有半截跑到屏幕外）
+    private func layoutBubble(_ petFrame: NSRect, display: Bool = true) {
+        let w = bubbleSize.width, h = bubbleSize.height
+        let screen = NSScreen.screens.first { $0.frame.intersects(petFrame) } ?? NSScreen.main
+        let v = screen?.visibleFrame ?? petFrame
+        var x = petFrame.midX - w / 2
+        x = max(v.minX + 6, min(x, v.maxX - w - 6))
+        var y = petFrame.maxY - 30
+        y = max(v.minY + 4, min(y, v.maxY - h - 4))
+        setFrame(NSRect(x: x, y: y, width: w, height: h), display: display)
     }
 }
 
@@ -398,6 +466,23 @@ final class PetController: NSObject {
     private var lastMousePoint = NSPoint.zero
     private var dragDistance: CGFloat = 0
     private var walkDirection: CGFloat = -1
+    /// 走路单独用 60Hz 定时器推进（见 syncWalkTimer），只在走路时存在
+    private var walkTimer: Timer?
+    private var lastWalkAt: CFAbsoluteTime = 0
+    /// 走路用的带小数横坐标锚点（窗口 frame 只保留整点，见 walkStep 里的说明）
+    private var walkAnchorX: CGFloat = 0
+    /// 帧推进的时间余数：只按 tick 间隔判断条件的话，余数每次都被丢掉，整体会越跑越慢
+    private var frameAccum: Double = 0
+    /// 台词是异步取的，回包时状态可能已经换了，用它丢弃过期结果
+    private var talkToken = 0
+    /// 是否已经把窗口设成「不吃鼠标事件」（鼠标落在素材的透明像素上时）
+    private var passThrough = false
+    private var alphaRepKey: String?
+    private var alphaRep: NSBitmapImageRep?
+    /// 滚轮调大小累积量
+    private var scrollAccum: CGFloat = 0
+    /// 专注结束的提示音。必须持有引用，否则 NSSound 可能在播完前就被释放
+    private var focusChime: NSSound?
     private var blinkingUntil: CFAbsoluteTime = 0
     private var blinkStart: CFAbsoluteTime = 0
     private var blinkImages: [NSImage] = []
@@ -424,6 +509,10 @@ final class PetController: NSObject {
     private let turnDuration: Double = 0.22
     private var manualHoldUntil: CFAbsoluteTime = 0
 
+    // 屏幕参数变化 / 休眠唤醒的通知令牌（两个通知中心不同，分开保存）
+    private var screenObservers: [NSObjectProtocol] = []
+    private var workspaceObservers: [NSObjectProtocol] = []
+
     // 视频动画（HEVC + alpha）
     private var avPlayer: AVQueuePlayer?
     private var looper: AVPlayerLooper?
@@ -436,6 +525,10 @@ final class PetController: NSObject {
     private var endObserver: NSObjectProtocol?
     private var lastStillImage: NSImage?
     private var flyScreen: NSScreen?
+    /// playBounds 在 60Hz 物理里每帧都调，而 NSScreen.screens 每次都要向 WindowServer 取一遍，
+    /// 再加两次 map + 一次 contains，纯属白烧。屏幕变化时由 clampWindowToVisibleArea 立刻作废。
+    private var boundsCache: (minX: CGFloat, maxX: CGFloat, minY: CGFloat, maxY: CGFloat)?
+    private var boundsCacheAt: CFAbsoluteTime = 0
     private var flyTraceFile: FileHandle?
     private var dragSamples: [(t: CFAbsoluteTime, origin: NSPoint)] = []
 
@@ -490,7 +583,7 @@ final class PetController: NSObject {
         layer.isHidden = true
         super.init()
 
-        moveToDefaultPosition()
+        restorePosition()
 
         view.controller = self
         blinkImages = Catalog.blinkFiles.compactMap { Assets.shared.image(Catalog.blinkFolder + "/" + $0) }
@@ -499,24 +592,89 @@ final class PetController: NSObject {
         window.orderFrontRegardless()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
             guard let self else { return }
-            self.moveToDefaultPosition()
+            self.restorePosition()
             NSLog("[XiezhiPet] repositioned frame=\(self.window.frame) screens=\(NSScreen.screens.count)")
         }
 
+        // 容差让系统把这些定时器合并到同一次唤醒里，省电；帧推进按真实 dt 走，被推迟也不影响节奏
         tickTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 12.0, repeats: true) { [weak self] _ in
             self?.tick()
         }
+        tickTimer?.tolerance = 0.03
         RunLoop.main.add(tickTimer!, forMode: .common)
 
         behaviorTimer = Timer.scheduledTimer(withTimeInterval: behaviorInterval, repeats: true) { [weak self] _ in
             self?.idleBehavior()
         }
+        behaviorTimer?.tolerance = min(2.0, behaviorInterval * 0.2)
         RunLoop.main.add(behaviorTimer!, forMode: .common)
 
         blinkTimer = Timer.scheduledTimer(withTimeInterval: 5.5, repeats: true) { [weak self] _ in
             self?.randomBlink()
         }
+        blinkTimer?.tolerance = 0.8
         RunLoop.main.add(blinkTimer!, forMode: .common)
+
+        // 拔外接屏 / 改分辨率 / 休眠唤醒后，把窗口夹回可见区域，别留在屏幕外
+        screenObservers.append(NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil, queue: .main) { [weak self] _ in
+                self?.clampWindowToVisibleArea()
+            })
+        workspaceObservers.append(NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil, queue: .main) { [weak self] _ in
+                self?.clampWindowToVisibleArea()
+            })
+    }
+
+    deinit {
+        screenObservers.forEach { NotificationCenter.default.removeObserver($0) }
+        workspaceObservers.forEach { NSWorkspace.shared.notificationCenter.removeObserver($0) }
+    }
+
+    /// 屏幕参数变化或唤醒后，把窗口夹回任一屏幕的可见区域（保留用户当前位置）
+    private func clampWindowToVisibleArea() {
+        invalidateBoundsCache()
+        let f = window.frame
+        guard !NSScreen.screens.isEmpty else { return }
+        let screen = NSScreen.screens.first { $0.frame.intersects(f) } ?? NSScreen.main
+        guard let v = screen?.visibleFrame else { return }
+        var o = f.origin
+        o.x = max(v.minX, min(o.x, v.maxX - f.width))
+        o.y = max(v.minY, min(o.y, v.maxY - f.height))
+        if o.x != f.origin.x || o.y != f.origin.y {
+            window.setFrameOrigin(o)
+            // 走路中被动改了位置，锚点要跟上，否则下一步会跳回原处
+            if walkTimer != nil { walkAnchorX = o.x }
+        }
+    }
+
+    /// 上次放在哪儿就放回哪儿；没有记录（或那块屏已经拔了）才落到默认的右下角
+    private func restorePosition() {
+        // 两个标量键，不用数组：`array(forKey:) as? [NSNumber]` 在这套工具链上
+        // 对 __NSCFNumber 的条件转换会失败（返回 nil），踩过。
+        let d = UserDefaults.standard
+        if d.object(forKey: "lastX") != nil, d.object(forKey: "lastY") != nil {
+            let p = NSPoint(x: CGFloat(d.double(forKey: "lastX")), y: CGFloat(d.double(forKey: "lastY")))
+            let fits = NSScreen.screens.contains {
+                $0.visibleFrame.insetBy(dx: -petSize / 2, dy: -petSize / 2).contains(p)
+            }
+            if fits {
+                window.setFrameOrigin(p)
+                return
+            }
+            xlog("saved origin \(p) 不在任何屏幕内，回默认位置")
+        }
+        moveToDefaultPosition()
+    }
+
+    /// 记住当前位置，下次启动接着放（别每次开机都跳回右下角）
+    func savePosition() {
+        guard !isFlying, !isDropping, !dragging else { return }
+        let o = window.frame.origin
+        UserDefaults.standard.set(Double(o.x), forKey: "lastX")
+        UserDefaults.standard.set(Double(o.y), forKey: "lastY")
     }
 
     private func moveToDefaultPosition() {
@@ -564,6 +722,8 @@ final class PetController: NSObject {
         stateStartTime = CFAbsoluteTimeGetCurrent()
         lastFrameTime = stateStartTime
         frameIndex = 0
+        frameAccum = 0
+        if newState != .walk { stopWalkTimer() }
         if newState == .hideWait {
             anim = Animation(folder: "13_hide", files: [Catalog.hideWaitFile], fps: 1.0, loop: true, hold: 0)
         } else {
@@ -588,6 +748,12 @@ final class PetController: NSObject {
     private func tick() {
         let now = CFAbsoluteTimeGetCurrent()
 
+        // 走路是否该由 60Hz 专用定时器接管，放在早退之前判断
+        syncWalkTimer()
+        // 透明像素上放开鼠标事件（点击穿透），气泡跟着宠物走
+        updateClickThrough()
+        bubble.follow(window.frame)
+
         // 专注看书：彻底静止，不做任何帧推进、位移或眼神变化
         if isFocusing {
             if state != .study { setState(.study) }
@@ -596,7 +762,9 @@ final class PetController: NSObject {
         // 纸片转身过渡由 60Hz 定时器推进
         if turning { return }
 
-        let dt = now - lastFrameTime
+        // 夹一下：转身/睡眠醒来后 dt 会很大，别让它一次推进几十帧
+        let dt = min(0.25, max(0, now - lastFrameTime))
+        lastFrameTime = now
 
         // 按住不动时也持续记位置样本，这样“停顿”能被 releaseVelocity 感知
         if dragging {
@@ -604,21 +772,28 @@ final class PetController: NSObject {
             while dragSamples.count > 32 { dragSamples.removeFirst() }
         }
 
-        if state == .walk { step() }
-
         let hasVideo = currentVideoName != nil || Assets.shared.videoURL(state.rawValue) != nil
         if frames.count > 1 && !hasVideo {
-            let interval = 1.0 / anim.fps
-            if dt >= interval {
-                lastFrameTime = now
-                if frameIndex + 1 < frames.count {
-                    frameIndex += 1
-                } else if anim.loop {
-                    frameIndex = 0
+            // speed 也要算进去：原来只按 fps 推进，sequence.json 里的 speed 对帧率无效
+            let interval = 1.0 / max(0.1, anim.fps * max(0.1, anim.speed))
+            frameAccum += dt
+            if frameAccum >= interval {
+                // 余数留着，不丢掉；一 tick 可能跨多帧
+                var advance = Int(frameAccum / interval)
+                frameAccum -= Double(advance) * interval
+                if advance > frames.count { advance = frames.count }
+                for _ in 0..<advance {
+                    if frameIndex + 1 < frames.count {
+                        frameIndex += 1
+                    } else if anim.loop {
+                        frameIndex = 0
+                    } else {
+                        break
+                    }
                 }
             }
-        } else if state == .idle || state == .study || hasVideo {
-            lastFrameTime = now
+        } else {
+            frameAccum = 0
         }
         render()
 
@@ -678,6 +853,12 @@ final class PetController: NSObject {
 
     private func render() {
         if turning { return }
+        // 窗口被 orderOut 之后 AVPlayer 不会自己停：隐藏一整天就等于解码一整天。
+        // 这里直接收手，重新显示后的下一拍会自动从 playVideoIfNeeded 恢复播放。
+        if !window.isVisible {
+            pauseVideoIfPlaying()
+            return
+        }
         // 拖动时窗口每帧都在移动，视频层跟着移动会闪；改用静态“被拎起”画面
         if (dragging || isDropping), let liftStill = Assets.shared.endImage("lift") {
             pauseVideoIfPlaying()
@@ -704,9 +885,11 @@ final class PetController: NSObject {
             // 只显示一层，避免静图和视频帧错位叠成「两个角色」；之后再切回视频
             let now = CFAbsoluteTimeGetCurrent()
             let still = Assets.shared.image("still/\(state.rawValue).png")
-            if now < backdropUntil, let still {
-                showStill(still)
-            } else if videoLayer?.isReadyForDisplay != true, now < backdropUntil + 0.35, let still {
+            let ready = videoLayer?.isReadyForDisplay == true
+            // 至少顶 0.28 秒静帧避免静图与视频帧错位叠成双影；
+            // 之后也必须等视频真正出首帧才切层。原来超时无条件切到未就绪的
+            // 视频层会露黑帧（视频损坏或解码慢时尤其明显）。
+            if (now < backdropUntil || !ready), let still {
                 showStill(still)
             } else {
                 if let vl = videoLayer { CATransaction.begin(); CATransaction.setDisableActions(true); vl.isHidden = false; CATransaction.commit() }
@@ -875,21 +1058,147 @@ final class PetController: NSObject {
 
     // MARK: 行走
 
-    private func step() {
-        let speed: CGFloat = 1.4
-        var origin = window.frame.origin
-        origin.x += speed * walkDirection
+    /// 走路是否该由 60Hz 定时器接管。只在走路时创建，切走就销毁，平时不额外耗电。
+    private func syncWalkTimer() {
+        let shouldWalk = state == .walk && !dragging && !turning && !isFlying
+            && !isDropping && !isFocusing && !isSuspended
+        guard shouldWalk else { stopWalkTimer(); return }
+        guard walkTimer == nil else { return }
+        lastWalkAt = CFAbsoluteTimeGetCurrent()
+        walkAnchorX = window.frame.origin.x
+        let t = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+            self?.walkStep()
+        }
+        RunLoop.main.add(t, forMode: .common)
+        walkTimer = t
+    }
+
+    private func stopWalkTimer() {
+        guard walkTimer != nil else { return }
+        walkTimer?.invalidate()
+        walkTimer = nil
+        savePosition()
+    }
+
+    /// 按真实经过时间位移。原来是 12Hz 下每 tick 挪固定 1.4pt，
+    /// 肉眼就是「一格一格」地蹭，而且 Timer 掉一拍就变慢。
+    ///
+    /// 坑：NSWindow 的 frame 起点会被量化到整点（写入 1249.715，读回 1249.000），
+    /// 所以不能拿 window.frame.origin 当累加器——每步的小数都被丢掉，
+    /// 0.28pt 的步进会被截断成整整 1pt，实际速度变成 60pt/s。
+    /// 因此另存一个带小数的 walkAnchorX，窗口只负责显示它。
+    private func walkStep() {
+        guard state == .walk, !dragging, !isFlying, !turning, !isDropping else {
+            stopWalkTimer()
+            return
+        }
+        let now = CFAbsoluteTimeGetCurrent()
+        let dt = min(0.1, max(0, now - lastWalkAt))
+        lastWalkAt = now
+        guard dt > 0 else { return }
+
+        // 16.8 pt/s：和原来 12Hz × 1.4pt 的设计速度一致，只把步进节奏抹匀
+        let speed: CGFloat = 16.8
+        var anchor = walkAnchorX + speed * CGFloat(dt) * walkDirection
         guard let screenFrame = (window.screen ?? NSScreen.main)?.visibleFrame else { return }
-        if origin.x < screenFrame.minX {
-            origin.x = screenFrame.minX
+        if anchor < screenFrame.minX {
+            anchor = screenFrame.minX
             walkDirection = 1
             faceRight = true
-        } else if origin.x + petSize > screenFrame.maxX {
-            origin.x = screenFrame.maxX - petSize
+        } else if anchor + petSize > screenFrame.maxX {
+            anchor = screenFrame.maxX - petSize
             walkDirection = -1
             faceRight = false
         }
-        window.setFrameOrigin(origin)
+        walkAnchorX = anchor
+        window.setFrameOrigin(NSPoint(x: anchor, y: window.frame.origin.y))
+    }
+
+    // MARK: 点击穿透 / 滚轮缩放
+
+    /// 素材是 320×320 的方形图，角色只占中间一块，四角是大片纯透明。
+    /// 鼠标落在这类像素上时把窗口设成不吃鼠标事件，点击就能落到下面的桌面或窗口。
+    /// 判定完全靠自绘的 12Hz 轮询（不依赖全局鼠标监听），失效时最差也只是某块区域点不动。
+    private func updateClickThrough() {
+        guard !dragging, !isDropping, !isFlying, !turning, !isFocusing, window.isVisible else {
+            setPassThrough(false)
+            return
+        }
+        let mouse = NSEvent.mouseLocation
+        let wf = window.frame
+        guard wf.contains(mouse) else {
+            setPassThrough(false)
+            return
+        }
+        setPassThrough(isTransparent(at: NSPoint(x: mouse.x - wf.minX, y: mouse.y - wf.minY)))
+    }
+
+    private func setPassThrough(_ on: Bool) {
+        guard on != passThrough else { return }
+        passThrough = on
+        window.ignoresMouseEvents = on
+        if ProcessInfo.processInfo.environment["XIEZHI_PASS_LOG"] == "1" {
+            let m = NSEvent.mouseLocation
+            xlog(String(format: "passthrough=%@ mouse=(%.1f,%.1f) local=(%.1f,%.1f)",
+                        on ? "on" : "off", m.x, m.y,
+                        m.x - window.frame.minX, m.y - window.frame.minY))
+        }
+    }
+
+    /// 窗口内某点是不是全透明（坐标是窗口内的点，原点在左下）
+    private func isTransparent(at p: NSPoint) -> Bool {
+        guard let (data, w, h) = alphaBuffer() else { return false }
+        let size = window.frame.size
+        guard size.width > 1, size.height > 1 else { return false }
+        var u = p.x / size.width
+        if faceRight { u = 1 - u }              // 朝右时图层是镜像的
+        let v = 1 - p.y / size.height            // 视图非翻转，y=0 在底部；位图第 0 行是顶部
+        let px = Int(u * CGFloat(w))
+        let py = Int(v * CGFloat(h))
+        guard px >= 0, px < w, py >= 0, py < h else { return true }
+        return data[(py * w + px) * 4 + 3] < 8
+    }
+
+    /// 当前状态首帧的 RGBA 位图，只缓存一张（换状态才重建）。320×320 约 400KB。
+    private func alphaBuffer() -> (UnsafeMutablePointer<UInt8>, Int, Int)? {
+        let key = state.rawValue
+        if alphaRepKey == key, let rep = alphaRep, let d = rep.bitmapData {
+            return (d, rep.pixelsWide, rep.pixelsHigh)
+        }
+        let still = "still/\(key).png"
+        let fallback = anim.folder + "/" + (anim.files.first ?? "")
+        guard let img = Assets.shared.image(still) ?? Assets.shared.image(fallback),
+              let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
+        let w = cg.width, h = cg.height
+        guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: w, pixelsHigh: h,
+                                         bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                         isPlanar: false, colorSpaceName: .deviceRGB,
+                                         bytesPerRow: w * 4, bitsPerPixel: 32) else { return nil }
+        NSGraphicsContext.saveGraphicsState()
+        if let ctx = NSGraphicsContext(bitmapImageRep: rep) {
+            NSGraphicsContext.current = ctx
+            ctx.cgContext.clear(CGRect(x: 0, y: 0, width: w, height: h))
+            ctx.cgContext.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+        }
+        NSGraphicsContext.restoreGraphicsState()
+        alphaRep = rep
+        alphaRepKey = key
+        guard let d = rep.bitmapData else { return nil }
+        return (d, w, h)
+    }
+
+    /// 滚轮调大小：一格 8px。触控板每次给的位移很小，累积到 8 才动一下，避免轻轻一划就跳到底。
+    func scrollResize(delta: CGFloat, precise: Bool) {
+        guard !dragging, !turning, !isDropping, !isFlying else { return }
+        scrollAccum += precise ? delta : delta * 16
+        guard abs(scrollAccum) >= 8 else { return }
+        let dir: CGFloat = scrollAccum > 0 ? 1 : -1
+        scrollAccum = 0
+        // 先按范围夹住再比较：到了 120/360 还继续滚的话，原来会不停 setFrame + 重绘 + 写偏好
+        let target = max(120, min(360, petSize + dir * 8))
+        guard abs(target - petSize) > 0.5 else { return }
+        lastInteractionAt = CFAbsoluteTimeGetCurrent()
+        resize(to: target)
     }
 
     // MARK: 随机行为
@@ -937,13 +1246,30 @@ final class PetController: NSObject {
             setState(.fish)
         } else {
             guard allowTalk else { setState(.daze); return }
-            bubble.show(Lines.next(), above: window.frame)
+            speakLines()
             setState(.tablet)
         }
     }
 
     // MARK: 交互
-    // MARK: 交互
+
+    /// 弹气泡的统一入口。宠物被「显示/隐藏」藏起来时不要弹：
+    /// 气泡是独立窗口，看不见宠物却飘着一个气泡很奇怪。
+    private func showBubble(_ text: String, above frame: NSRect) {
+        guard window.isVisible else { return }
+        bubble.show(text, above: frame)
+    }
+
+    /// 说一句话。台词可能来自 Lawlearn 法条查询（异步），所以气泡晚一点才弹；
+    /// 回包时如果又说了别的，旧结果直接丢掉。
+    private func speakLines() {
+        talkToken &+= 1
+        let token = talkToken
+        Lines.next { [weak self] text in
+            guard let self, self.talkToken == token else { return }
+            self.showBubble(text, above: self.window.frame)
+        }
+    }
 
     func beginDrag() {
         cancelTurn()
@@ -974,6 +1300,7 @@ final class PetController: NSObject {
         origin.x += dx
         origin.y += dy
         window.setFrameOrigin(origin)
+        bubble.follow(window.frame)
 
         // 记录最近一小段位移，松手时换算成甩出速度
         dragSamples.append((CFAbsoluteTimeGetCurrent(), window.frame.origin))
@@ -993,6 +1320,7 @@ final class PetController: NSObject {
             origin.x = max(f.minX, min(origin.x, f.maxX - petSize))
             window.setFrameOrigin(origin)
         }
+        savePosition()
         // 甩得够快就进入皮球模式
         let v = releaseVelocity()
         xlog("release v=(\(Int(v.x)),\(Int(v.y)) pt/s dist=\(Int(dragDistance))")
@@ -1172,6 +1500,11 @@ final class PetController: NSObject {
 
     /// 弹跳边界：横向允许跨越所有屏幕，纵向按窗口中心所在那块屏算
     private func playBounds() -> (minX: CGFloat, maxX: CGFloat, minY: CGFloat, maxY: CGFloat) {
+        // 缓存 0.3 秒：屏幕布局不会在 60Hz 上变；跨屏后最多 0.3 秒拿到新边界，看不出来
+        let nowB = CFAbsoluteTimeGetCurrent()
+        if let c = boundsCache, nowB - boundsCacheAt < 0.3 {
+            return c
+        }
         let screens = NSScreen.screens
         let center = NSPoint(x: window.frame.midX, y: window.frame.midY)
         let current = screens.first { $0.frame.contains(center) }
@@ -1181,7 +1514,15 @@ final class PetController: NSObject {
         let gMinX = screens.map { $0.visibleFrame.minX }.min() ?? 0
         let gMaxX = screens.map { $0.visibleFrame.maxX }.max() ?? 1470
         let f = current?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1470, height: 923)
-        return (gMinX, gMaxX, f.minY, f.maxY)
+        let result = (gMinX, gMaxX, f.minY, f.maxY)
+        boundsCache = result
+        boundsCacheAt = nowB
+        return result
+    }
+
+    /// 屏幕参数变了：缓存立刻作废（不靠 0.3 秒自然过期）
+    private func invalidateBoundsCache() {
+        boundsCache = nil
     }
 
     private func startFlying(vx: CGFloat, vy: CGFloat) {
@@ -1304,7 +1645,8 @@ final class PetController: NSObject {
         if state == .hide || state == .hideWait { setState(.idle); return }
         manualAction = true
         setState(.pat)
-        if Bool.random() { bubble.show(Lines.next(), above: window.frame) }
+        // 摸头也有台词，同样要受「允许自言自语」约束
+        if allowTalk, Bool.random() { speakLines() }
     }
 
     func hideAction() {
@@ -1340,8 +1682,7 @@ final class PetController: NSObject {
     }
 
     /// 测试用：直接把角色抬到半空并当成“松手后悬停”
-    func testSuspend() {
-        guard let screen = window.screen ?? NSScreen.main else { return }
+    func testSuspend() {        guard let screen = window.screen ?? NSScreen.main else { return }
         var f = window.frame
         f.origin.y = screen.visibleFrame.minY + 300
         window.setFrameOrigin(f.origin)
@@ -1381,6 +1722,7 @@ final class PetController: NSObject {
         behaviorTimer = Timer.scheduledTimer(withTimeInterval: behaviorInterval, repeats: true) { [weak self] _ in
             self?.idleBehavior()
         }
+        behaviorTimer?.tolerance = min(2.0, behaviorInterval * 0.2)
         if let t = behaviorTimer { RunLoop.main.add(t, forMode: .common) }
     }
 
@@ -1448,6 +1790,9 @@ final class PetController: NSObject {
         let hideItem = NSMenuItem(title: "躲进毛球", action: #selector(menuHide), keyEquivalent: "")
         hideItem.target = self
         menu.addItem(hideItem)
+        let homeItem = NSMenuItem(title: "回到右下角", action: #selector(menuHome), keyEquivalent: "")
+        homeItem.target = self
+        menu.addItem(homeItem)
         let lawItem: NSMenuItem
         if Lawlearn.installed {
             lawItem = NSMenuItem(title: "与 Lawlearn 联动",
@@ -1472,7 +1817,7 @@ final class PetController: NSObject {
         setLawlearnLinked(on)
         sender.state = on ? .on : .off
         xlog("lawlearn: 联动 -> \(on ? "开" : "关")  connected=\(Lawlearn.shared.connected)")
-        bubble.show(on ? "已和 Lawlearn 联动" : "已取消联动", above: window.frame)
+        showBubble(on ? "已和 Lawlearn 联动" : "已取消联动", above: window.frame)
     }
 
     @objc private func menuPicked(_ sender: NSMenuItem) {
@@ -1498,11 +1843,20 @@ final class PetController: NSObject {
     }
 
     @objc private func menuSay() {
-        guard allowTalk else { bubble.show("我在专心看书", above: window.frame); return }
+        // 原来这里写「我在专心看书」，可关掉自言自语并不等于在专注，容易看糊涂
+        guard allowTalk else { showBubble("自言自语关掉了，去控制台打开", above: window.frame); return }
         say()
     }
 
     @objc private func menuHide() { hideAction() }
+
+    /// 回到默认的右下角（位置会被记住，下次启动也在这儿）
+    @objc private func menuHome() {
+        lastInteractionAt = CFAbsoluteTimeGetCurrent()
+        moveToDefaultPosition()
+        savePosition()
+        showBubble("回老位置啦", above: window.frame)
+    }
 
     @objc private func menuConsole() {
         NotificationCenter.default.post(name: Notification.Name("XiezhiOpenConsole"), object: nil)
@@ -1511,19 +1865,22 @@ final class PetController: NSObject {
     func startStudy() {
         // 已经在专注就别再挂一个 25 分钟定时器，否则多份回调同时到点会来回切状态
         guard !isFocusing else {
-            bubble.show("已经在专注啦", above: window.frame)
+            showBubble("已经在专注啦", above: window.frame)
             return
         }
         isFocusing = true
         studySession += 1
         let session = studySession
         setState(.study)
-        bubble.show(Lines.focusStart, above: window.frame)
+        showBubble(Lines.focusStart, above: window.frame)
         DispatchQueue.main.asyncAfter(deadline: .now() + 25 * 60) { [weak self] in
             guard let self, self.studySession == session else { return }
             self.isFocusing = false
             self.setState(.play)
-            self.bubble.show(Lines.focusEnd, above: self.window.frame)
+            // 到点得让人听得见：宠物可能被别的窗口挡住，光弹气泡容易被漏看
+            if focusChime == nil { focusChime = NSSound(named: "Glass") }
+            focusChime?.play()
+            self.showBubble(Lines.focusEnd, above: self.window.frame)
             DispatchQueue.main.asyncAfter(deadline: .now() + 5 * 60) { [weak self] in
                 guard let self, self.state == .play else { return }
                 self.setState(.idle)
@@ -1549,7 +1906,7 @@ final class PetController: NSObject {
 
     func say() {
         lastInteractionAt = CFAbsoluteTimeGetCurrent()
-        bubble.show(Lines.next(), above: window.frame)
+        speakLines()
         // 专注中只说话，不抢走看书状态；已经在抱平板就只换台词，避免反复重建视频
         if isFocusing || state == .study || state == .tablet { return }
         setState(.tablet)
@@ -1598,7 +1955,8 @@ final class ConsoleWindow: NSObject, NSWindowDelegate {
         let content = NSView(frame: NSRect(x: 0, y: 0, width: 420, height: 600))
         panel.contentView = content
 
-        content.addSubview(label("左键：拖拽 / 轻点摸头　　右键：选动作", NSRect(x: 20, y: 540, width: 380, height: 18),
+        content.addSubview(label("左键：拖拽 / 轻点摸头　　滚轮：调大小　　右键：选动作",
+                                 NSRect(x: 20, y: 540, width: 380, height: 18),
                                 size: 12, color: .secondaryLabelColor))
 
         // 角色大小
@@ -1704,14 +2062,35 @@ final class ConsoleWindow: NSObject, NSWindowDelegate {
     func show() {
         syncFromController()
         guard let w = window else { return }
-        let screen = controller?.window.screen ?? NSScreen.main
-        if let f = screen?.visibleFrame {
-            let origin = NSPoint(x: f.midX - w.frame.width / 2, y: f.midY - w.frame.height / 2)
-            w.setFrameOrigin(origin)
-        }
+        placeConsole(w)
         NSApp.activate(ignoringOtherApps: true)
         w.makeKeyAndOrderFront(nil)
         xlog("console shown frame=\(w.frame) visible=\(w.isVisible) key=\(w.isKeyWindow)")
+    }
+
+    /// 控制台位置：挪过就记住，没挪过（或那位置已经不在任何屏幕上）才居中到宠物所在那块屏。
+    /// 原来每次打开都强制居中，挪开了下次又跑回中间。
+    private func placeConsole(_ w: NSWindow) {
+        let d = UserDefaults.standard
+        if d.object(forKey: "consoleX") != nil, d.object(forKey: "consoleY") != nil {
+            let p = NSPoint(x: d.double(forKey: "consoleX"), y: d.double(forKey: "consoleY"))
+            let probe = NSRect(origin: p, size: w.frame.size).insetBy(dx: 40, dy: 40)
+            if NSScreen.screens.contains(where: { $0.visibleFrame.intersects(probe) }) {
+                w.setFrameOrigin(p)
+                return
+            }
+        }
+        let screen = controller?.window.screen ?? NSScreen.main
+        if let f = screen?.visibleFrame {
+            w.setFrameOrigin(NSPoint(x: f.midX - w.frame.width / 2, y: f.midY - w.frame.height / 2))
+        }
+    }
+
+    func windowDidMove(_ notification: Notification) {
+        guard let w = notification.object as? NSWindow else { return }
+        let o = w.frame.origin
+        UserDefaults.standard.set(Double(o.x), forKey: "consoleX")
+        UserDefaults.standard.set(Double(o.y), forKey: "consoleY")
     }
 
     @objc private func sizeChanged() {
@@ -1943,6 +2322,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func toggleVisible() { controller.toggleVisible() }
     @objc func speak() { controller.say() }
     @objc func quit() { NSApp.terminate(nil) }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        // 退出前记一下位置，下次启动接着放
+        controller?.savePosition()
+    }
 }
 
 let app = NSApplication.shared

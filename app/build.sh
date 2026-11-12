@@ -34,5 +34,7 @@ for folder, name in keep:
     shutil.copy2(s, os.path.join(dst, folder, name))
 print("static frames copied:", len(keep))
 PY
-codesign --force --deep --sign - "$APP" 2>/dev/null || true
-echo "built: $APP"
+# 不再吞掉签名失败：set -e 会让失败直接退出，并再校验一次封印
+codesign --force --deep --sign - "$APP"
+codesign --verify --deep --strict "$APP"
+echo "built: $APP (签名已校验)"
