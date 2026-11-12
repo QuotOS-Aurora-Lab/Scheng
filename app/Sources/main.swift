@@ -1756,18 +1756,20 @@ final class PetController: NSObject {
 
     // MARK: 右键动作菜单
 
+    /// 右键动作菜单的分组。标题尽量短——菜单宽度是按最长那一行算的，
+    /// 「与 Lawlearn 联动」这种中英混排会把整块菜单撑到 178pt 宽。
     static let actionGroups: [(String, [(String, PetState)])] = [
-        ("日常", [("发呆", .daze), ("打哈欠", .yawn), ("甩尾巴", .tail), ("打滚", .play),
-                  ("伸懒腰", .stretch), ("挥手打招呼", .wave), ("蓄势扑跳", .pounce),
+        ("日常", [("发呆", .daze), ("打哈欠", .yawn), ("甩尾", .tail), ("打滚", .play),
+                  ("伸懒腰", .stretch), ("挥手", .wave), ("扑跳", .pounce),
                   ("蹲起", .squat), ("睡着", .sleep), ("摸头", .pat)]),
         ("学习", [("抱平板", .tablet), ("专注看书", .study), ("敲法槌", .gavel),
-                  ("敲键盘", .type), ("翻页看书", .page), ("记笔记", .note)]),
-        ("吃喝玩", [("舔毛洗爪", .groom), ("吃小鱼干", .fish), ("走路", .walk),
+                  ("敲键盘", .type), ("翻页", .page), ("记笔记", .note)]),
+        ("吃喝玩", [("舔毛", .groom), ("小鱼干", .fish), ("走路", .walk),
                     ("待机", .idle), ("被拎起", .lift), ("落地", .land)])
     ]
 
-    func showActionMenu() {
-        lastInteractionAt = CFAbsoluteTimeGetCurrent()
+    /// 构建右键菜单。抽成独立方法，弹不弹都能先拿到菜单对象（也才好量它的尺寸）。
+    func buildActionMenu() -> NSMenu {
         let menu = NSMenu()
         menu.autoenablesItems = false
         for (groupTitle, items) in Self.actionGroups {
@@ -1790,26 +1792,53 @@ final class PetController: NSObject {
         let hideItem = NSMenuItem(title: "躲进毛球", action: #selector(menuHide), keyEquivalent: "")
         hideItem.target = self
         menu.addItem(hideItem)
-        let homeItem = NSMenuItem(title: "回到右下角", action: #selector(menuHome), keyEquivalent: "")
+        let homeItem = NSMenuItem(title: "回右下角", action: #selector(menuHome), keyEquivalent: "")
         homeItem.target = self
         menu.addItem(homeItem)
         let lawItem: NSMenuItem
         if Lawlearn.installed {
-            lawItem = NSMenuItem(title: "与 Lawlearn 联动",
+            lawItem = NSMenuItem(title: "法条联动",
                                  action: #selector(menuToggleLawlearn(_:)), keyEquivalent: "")
             lawItem.target = self
             lawItem.state = Lawlearn.linked ? .on : .off
         } else {
-            lawItem = NSMenuItem(title: "本机未安装 Lawlearn", action: nil, keyEquivalent: "")
+            lawItem = NSMenuItem(title: "未装 Lawlearn", action: nil, keyEquivalent: "")
             lawItem.isEnabled = false
             lawItem.state = .off
         }
         menu.addItem(lawItem)
         menu.addItem(.separator())
-        let consoleItem = NSMenuItem(title: "打开控制台…", action: #selector(menuConsole), keyEquivalent: "")
+        let consoleItem = NSMenuItem(title: "控制台…", action: #selector(menuConsole), keyEquivalent: "")
         consoleItem.target = self
         menu.addItem(consoleItem)
-        menu.popUp(positioning: nil, at: NSPoint(x: 4, y: view.bounds.maxY - 4), in: view)
+        return menu
+    }
+
+    func showActionMenu() {
+        lastInteractionAt = CFAbsoluteTimeGetCurrent()
+        let menu = buildActionMenu()
+        // 用 context menu 的方式在指针处弹出：贴住鼠标、靠近屏幕下沿会自动向上翻。
+        // 原来是从宠物头顶往下展开，宠物站在屏幕底部，224pt 高的菜单顶出屏幕下沿，
+        // 系统只好把菜单夹回来并加上下滚动箭头——就是「展开不全、要翻」的来源。
+        if let ev = NSApp.currentEvent, ev.window === view.window,
+           ev.type == .rightMouseDown || ev.type == .leftMouseDown {
+            NSMenu.popUpContextMenu(menu, with: ev, for: view)
+            return
+        }
+        // 没有可用的鼠标事件（例如由调试开关触发）：自己算一个能完整放下整块菜单的位置。
+        menu.update()
+        let size = menu.size
+        let pet = window.frame
+        let vf = (window.screen ?? NSScreen.main)?.visibleFrame ?? pet
+        // X 默认和宠物居中对齐，Y 默认贴在宠物头顶；哪一边放不下就贴屏幕边。
+        let x = max(vf.minX + 4, min(pet.midX - size.width / 2, vf.maxX - size.width - 4))
+        var top = pet.maxY + 4
+        if top + size.height > vf.maxY { top = vf.maxY - 4 }
+        // 屏幕坐标 → 窗口坐标 → 视图坐标。view.convert(_:from: nil) 认的是窗口坐标，
+        // 直接把屏幕坐标丢进去会整体偏出窗口原点（踩过：菜单跑到屏幕外）。
+        let winPoint = window.convertFromScreen(NSRect(origin: NSPoint(x: x, y: top), size: .zero)).origin
+        let anchor = view.convert(winPoint, from: nil)
+        menu.popUp(positioning: nil, at: anchor, in: view)
     }
 
     @objc private func menuToggleLawlearn(_ sender: NSMenuItem) {
