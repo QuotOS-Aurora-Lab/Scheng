@@ -1,0 +1,17 @@
+idle_up https://aka.doubaocdn.com/s/IeDm2cBTQ3
+idle_down https://aka.doubaocdn.com/s/EE0MnWVN41
+blink_half https://aka.doubaocdn.com/s/OhVQN1ewdh
+walk_raise https://aka.doubaocdn.com/s/r95UthY5PF
+walk_plant https://aka.doubaocdn.com/s/WU7WVzLkij
+lift_swing https://aka.doubaocdn.com/s/yccrbx9YaE
+land_bounce https://aka.doubaocdn.com/s/2dLluf6lnN
+pat_other https://aka.doubaocdn.com/s/UkI7I9PN5q
+yawn_close https://aka.doubaocdn.com/s/fSfR43zc71
+tail_rev https://aka.doubaocdn.com/s/3YEXMgcFIq
+study_page https://aka.doubaocdn.com/s/Lw5oJb6OzT
+study_up https://aka.doubaocdn.com/s/IPfyPFJxjq
+play_side https://aka.doubaocdn.com/s/2Mmeds7eoa
+hide_ball https://aka.doubaocdn.com/s/vTaRmlTYVU
+tablet_up https://aka.doubaocdn.com/s/VydPMANsGE
+land_touch https://aka.doubaocdn.com/s/HeYJVzMxBl
+pat_laugh https://aka.doubaocdn.com/s/wFBj8pLUpK

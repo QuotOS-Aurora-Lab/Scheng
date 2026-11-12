@@ -1,0 +1,23 @@
+set -e
+declare -A M=(
+ [idle_02]="https://aka.doubaocdn.com/s/lUdxgsIHfm"
+ [lift_01]="https://aka.doubaocdn.com/s/KZPIxblVVH"
+ [land_squash]="https://aka.doubaocdn.com/s/9FJczXuVuk"
+ [land_stand]="https://aka.doubaocdn.com/s/UdHrGD3X1J"
+ [walk_a]="https://aka.doubaocdn.com/s/Hi5JEAvnyq"
+ [walk_b]="https://aka.doubaocdn.com/s/kSOdxU6IHY"
+ [pat_01]="https://aka.doubaocdn.com/s/WrrPBMN4NC"
+ [daze_01]="https://aka.doubaocdn.com/s/bkhsPG4mgy"
+ [yawn_half]="https://aka.doubaocdn.com/s/1hI6UcbSr1"
+ [yawn_max]="https://aka.doubaocdn.com/s/gECKjUeH7z"
+ [tail_01]="https://aka.doubaocdn.com/s/L1UQmJLFot"
+ [study_01]="https://aka.doubaocdn.com/s/gGjHaNJbrs"
+ [play_lie]="https://aka.doubaocdn.com/s/DWFXBuv1jw"
+ [play_roll]="https://aka.doubaocdn.com/s/ibofeqTqeJ"
+ [look_left]="https://aka.doubaocdn.com/s/yjg0FtL2aC"
+ [hide_curl]="https://aka.doubaocdn.com/s/gVWvR1U1Xt"
+ [hide_peek]="https://aka.doubaocdn.com/s/BXj2W4qnWt"
+)
+mkdir -p raw
+for k in "${!M[@]}"; do curl -sL -o "raw/$k.jpg" "${M[$k]}"; done
+ls raw | wc -l

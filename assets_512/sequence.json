@@ -1,0 +1,374 @@
+{
+  "states": {
+    "idle": {
+      "folder": "01_idle",
+      "files": [
+        "idle_01.png",
+        "idle_02.png",
+        "idle_03.png",
+        "idle_04.png",
+        "idle_05.png",
+        "idle_06.png",
+        "idle_07.png",
+        "idle_08.png",
+        "idle_09.png",
+        "idle_10.png",
+        "idle_11.png",
+        "idle_12.png",
+        "idle_13.png",
+        "idle_14.png",
+        "idle_15.png",
+        "idle_16.png",
+        "idle_17.png",
+        "idle_18.png",
+        "idle_19.png",
+        "idle_20.png",
+        "idle_21.png",
+        "idle_22.png",
+        "idle_23.png",
+        "idle_24.png"
+      ],
+      "fps": 12.0,
+      "loop": true,
+      "hold": 0
+    },
+    "blink": {
+      "folder": "01_blink",
+      "files": [
+        "blink_01.png",
+        "blink_01_m.png",
+        "blink_02.png",
+        "blink_02_m.png",
+        "blink_03.png"
+      ],
+      "fps": 8.33,
+      "loop": false,
+      "hold": 0
+    },
+    "lift": {
+      "folder": "02_lift",
+      "files": [
+        "lift_01.png",
+        "lift_01_m.png",
+        "lift_02.png",
+        "lift_02_m.png",
+        "lift_03.png",
+        "lift_03_m.png",
+        "lift_04.png",
+        "lift_04_m.png",
+        "lift_05.png"
+      ],
+      "fps": 14.4,
+      "loop": true,
+      "hold": 0
+    },
+    "land": {
+      "folder": "03_land",
+      "files": [
+        "land_01.png",
+        "land_01_m.png",
+        "land_02.png",
+        "land_02_m.png",
+        "land_03.png",
+        "land_03_m.png",
+        "land_04.png",
+        "land_04_m.png",
+        "land_05.png"
+      ],
+      "fps": 25.2,
+      "loop": false,
+      "hold": 0
+    },
+    "walk": {
+      "folder": "04_walk",
+      "files": [
+        "walk_01.png",
+        "walk_01_m.png",
+        "walk_02.png",
+        "walk_02_m.png",
+        "walk_03.png",
+        "walk_03_m.png",
+        "walk_04.png",
+        "walk_04_m.png",
+        "walk_05.png",
+        "walk_05_m.png",
+        "walk_06.png",
+        "walk_06_m.png",
+        "walk_07.png"
+      ],
+      "fps": 18.57,
+      "loop": true,
+      "hold": 0
+    },
+    "pat": {
+      "folder": "05_pat",
+      "files": [
+        "pat_01.png",
+        "pat_01_m.png",
+        "pat_02.png",
+        "pat_02_m.png",
+        "pat_03.png",
+        "pat_03_m.png",
+        "pat_04.png",
+        "pat_04_m.png",
+        "pat_05.png",
+        "pat_05_m.png",
+        "pat_06.png"
+      ],
+      "fps": 18.33,
+      "loop": false,
+      "hold": 0.3
+    },
+    "daze": {
+      "folder": "06_daze",
+      "files": [
+        "daze_01.png",
+        "daze_01_m.png",
+        "daze_02.png",
+        "daze_02_m.png",
+        "daze_03.png",
+        "daze_03_m.png",
+        "daze_04.png"
+      ],
+      "fps": 3.5,
+      "loop": true,
+      "hold": 3.2
+    },
+    "yawn": {
+      "folder": "07_yawn",
+      "files": [
+        "yawn_01.png",
+        "yawn_01_m.png",
+        "yawn_02.png",
+        "yawn_02_m.png",
+        "yawn_03.png",
+        "yawn_03_m.png",
+        "yawn_04.png",
+        "yawn_04_m.png",
+        "yawn_05.png",
+        "yawn_05_m.png",
+        "yawn_06.png"
+      ],
+      "fps": 12.83,
+      "loop": false,
+      "hold": 0
+    },
+    "tail": {
+      "folder": "08_tail",
+      "files": [
+        "tail_01.png",
+        "tail_01_m.png",
+        "tail_02.png",
+        "tail_02_m.png",
+        "tail_03.png",
+        "tail_03_m.png",
+        "tail_04.png"
+      ],
+      "fps": 17.5,
+      "loop": false,
+      "hold": 0
+    },
+    "tablet": {
+      "folder": "09_tablet",
+      "files": [
+        "tablet_01.png",
+        "tablet_01_m.png",
+        "tablet_02.png",
+        "tablet_02_m.png",
+        "tablet_03.png"
+      ],
+      "fps": 5.0,
+      "loop": true,
+      "hold": 3.6
+    },
+    "study": {
+      "folder": "10_study",
+      "files": [
+        "study_01.png",
+        "study_01_m.png",
+        "study_02.png",
+        "study_02_m.png",
+        "study_03.png",
+        "study_03_m.png",
+        "study_04.png",
+        "study_04_m.png",
+        "study_05.png"
+      ],
+      "fps": 2.7,
+      "loop": true,
+      "hold": 0
+    },
+    "play": {
+      "folder": "11_play",
+      "files": [
+        "play_01.png",
+        "play_01_m.png",
+        "play_02.png",
+        "play_02_m.png",
+        "play_03.png",
+        "play_03_m.png",
+        "play_04.png",
+        "play_04_m.png",
+        "play_05.png",
+        "play_05_m.png",
+        "play_06.png"
+      ],
+      "fps": 16.5,
+      "loop": false,
+      "hold": 0
+    },
+    "hide": {
+      "folder": "13_hide",
+      "files": [
+        "hide_04.png",
+        "hide_04_m.png",
+        "hide_03.png",
+        "hide_03_m.png",
+        "hide_05.png",
+        "hide_05_m.png",
+        "hide_02.png",
+        "hide_02_m.png",
+        "hide_06.png",
+        "hide_06_m.png",
+        "hide_01.png"
+      ],
+      "fps": 11.0,
+      "loop": false,
+      "hold": 0
+    },
+    "stretch": {
+      "folder": "14_stretch",
+      "files": [
+        "stretch_01.png",
+        "stretch_01_m.png",
+        "stretch_02.png",
+        "stretch_02_m.png",
+        "stretch_03.png",
+        "stretch_03_m.png",
+        "stretch_04.png",
+        "stretch_04_m.png",
+        "stretch_05.png"
+      ],
+      "fps": 10.8,
+      "loop": false,
+      "hold": 0.4
+    },
+    "sleep": {
+      "folder": "15_sleep",
+      "files": [
+        "sleep_01.png",
+        "sleep_01_m.png",
+        "sleep_02.png",
+        "sleep_02_m.png",
+        "sleep_03.png",
+        "sleep_03_m.png",
+        "sleep_04.png",
+        "sleep_04_m.png",
+        "sleep_05.png"
+      ],
+      "fps": 2.16,
+      "loop": true,
+      "hold": 14.0
+    },
+    "wave": {
+      "folder": "16_wave",
+      "files": [
+        "wave_01.png",
+        "wave_01_m.png",
+        "wave_02.png",
+        "wave_02_m.png",
+        "wave_03.png",
+        "wave_03_m.png",
+        "wave_04.png",
+        "wave_04_m.png",
+        "wave_05.png"
+      ],
+      "fps": 16.2,
+      "loop": false,
+      "hold": 0.4
+    },
+    "pounce": {
+      "folder": "17_pounce",
+      "files": [
+        "pounce_01.png",
+        "pounce_01_m.png",
+        "pounce_02.png",
+        "pounce_02_m.png",
+        "pounce_03.png",
+        "pounce_03_m.png",
+        "pounce_04.png",
+        "pounce_04_m.png",
+        "pounce_05.png"
+      ],
+      "fps": 18.0,
+      "loop": false,
+      "hold": 0.2
+    },
+    "gavel": {
+      "folder": "18_gavel",
+      "files": [
+        "gavel_01.png",
+        "gavel_01_m.png",
+        "gavel_02.png",
+        "gavel_02_m.png",
+        "gavel_03.png",
+        "gavel_03_m.png",
+        "gavel_04.png",
+        "gavel_04_m.png",
+        "gavel_05.png"
+      ],
+      "fps": 16.2,
+      "loop": false,
+      "hold": 0.3
+    },
+    "groom": {
+      "folder": "19_groom",
+      "files": [
+        "groom_01.png",
+        "groom_01_m.png",
+        "groom_02.png",
+        "groom_02_m.png",
+        "groom_03.png",
+        "groom_03_m.png",
+        "groom_04.png",
+        "groom_04_m.png",
+        "groom_05.png"
+      ],
+      "fps": 12.6,
+      "loop": false,
+      "hold": 0.2
+    },
+    "fish": {
+      "folder": "20_fish",
+      "files": [
+        "fish_01.png",
+        "fish_01_m.png",
+        "fish_02.png",
+        "fish_02_m.png",
+        "fish_03.png",
+        "fish_03_m.png",
+        "fish_04.png",
+        "fish_04_m.png",
+        "fish_05.png"
+      ],
+      "fps": 14.4,
+      "loop": false,
+      "hold": 0.3
+    }
+  },
+  "hideWait": "hide_02.png",
+  "hideFolder": "13_hide",
+  "look": {
+    "left": "12_look/look_left.png",
+    "mid": "12_look/look_mid.png",
+    "right": "12_look/look_right.png"
+  },
+  "blink": {
+    "folder": "01_blink",
+    "files": [
+      "blink_01.png",
+      "blink_02.png",
+      "blink_03.png"
+    ]
+  }
+}

@@ -1,0 +1,11 @@
+# 快照仓库按字节保存，禁止任何换行符或编码自动转换。
+* -text
+
+# 二进制素材不要让 git 尝试做文本 diff。
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.mov binary
+*.zip binary
+*.dmg binary
+*.icns binary
