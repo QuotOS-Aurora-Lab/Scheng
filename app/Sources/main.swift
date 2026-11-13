@@ -1826,6 +1826,11 @@ final class PetController: NSObject {
 
 // MARK: - 控制台（菜单栏点开）
 
+/// 顶部为原点的容器：控制台里的 frame 都按「距顶部多少」写，跟读稿顺序一致。
+final class FlippedView: NSView {
+    override var isFlipped: Bool { true }
+}
+
 final class ConsoleWindow: NSObject, NSWindowDelegate {
     private weak var controller: PetController?
     private var window: NSPanel?
@@ -1841,6 +1846,8 @@ final class ConsoleWindow: NSObject, NSWindowDelegate {
     private var lawCheck: NSButton!
     /// 动作预览的三个下拉（日常 / 学习 / 吃喝玩）
     private var actionPopups: [NSPopUpButton] = []
+    /// 快捷操作按钮，按 tag 存取（显示/隐藏那只要跟着宠物可见状态改标题）
+    private var quickButtons: [Int: NSButton] = [:]
 
     init(controller: PetController) {
         self.controller = controller
@@ -1848,127 +1855,213 @@ final class ConsoleWindow: NSObject, NSWindowDelegate {
         build()
     }
 
-    private func label(_ text: String, _ frame: NSRect, size: CGFloat, weight: NSFont.Weight = .regular, color: NSColor = .labelColor) -> NSTextField {
+    // 面板里的坐标一律「从上往下」：内容视图是 FlippedView，y=0 在顶部，
+    // 每块控件的位置由 cursor 依次累加。原来每个控件手写一个 y，改一行文案就得
+    // 连着挪下面十几行，很容易压在一起；现在加东西只会在下面顺延。
+    private let panelWidth: CGFloat = 440
+    private let margin: CGFloat = 24
+
+    private func makeLabel(_ text: String, size: CGFloat, weight: NSFont.Weight = .regular,
+                          color: NSColor = .labelColor) -> NSTextField {
         let l = NSTextField(labelWithString: text)
-        l.frame = frame
         l.font = NSFont.systemFont(ofSize: size, weight: weight)
         l.textColor = color
         return l
     }
 
+    private func makeSeparator() -> NSBox {
+        let b = NSBox()
+        b.boxType = .separator
+        return b
+    }
+
     private func build() {
-        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 420, height: 620),
+        let W = panelWidth
+        let M = margin
+        let CW = W - M * 2
+
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: W, height: 700),
                             styleMask: [.titled, .closable],
                             backing: .buffered, defer: false)
         panel.title = "Scheng · 控制台"
         panel.isReleasedWhenClosed = false
         panel.level = .floating
         panel.delegate = self
-        let content = NSView(frame: NSRect(x: 0, y: 0, width: 420, height: 620))
+        let content = FlippedView(frame: NSRect(x: 0, y: 0, width: W, height: 700))
         panel.contentView = content
 
-        content.addSubview(label("左键：拖拽搬家 / 轻点摸头　　大小、动作、台词都在这个面板里调",
-                                 NSRect(x: 20, y: 560, width: 380, height: 18),
-                                size: 12, color: .secondaryLabelColor))
-
-        // 角色大小
-        content.addSubview(label("角色大小", NSRect(x: 20, y: 522, width: 120, height: 20), size: 13, weight: .semibold))
-        sizeValue = label("", NSRect(x: 300, y: 522, width: 100, height: 20), size: 12, color: .secondaryLabelColor)
-        sizeValue.alignment = .right
-        content.addSubview(sizeValue)
-        sizeSlider = NSSlider(value: 240, minValue: 120, maxValue: 360, target: self, action: #selector(sizeChanged))
-        sizeSlider.frame = NSRect(x: 20, y: 494, width: 380, height: 22)
-        sizeSlider.isContinuous = true
-        content.addSubview(sizeSlider)
-
-        let presets: [(String, CGFloat)] = [("迷你", 140), ("小", 180), ("标准", 240), ("大", 320)]
-        for (i, p) in presets.enumerated() {
-            let b = NSButton(title: p.0, target: self, action: #selector(presetTapped(_:)))
-            b.tag = Int(p.1)
-            b.bezelStyle = .rounded
-            b.frame = NSRect(x: 20 + CGFloat(i) * 96, y: 454, width: 88, height: 26)
+        var y: CGFloat = 18
+        // 占一行：返回这一行的顶部 y，并把 cursor 推到下一行
+        func take(_ h: CGFloat, _ gap: CGFloat) -> CGFloat {
+            let top = y
+            y += h + gap
+            return top
+        }
+        // 小节标题 + 右侧数值
+        func header(_ title: String, value: NSTextField) {
+            let top = take(19, 4)
+            let t = makeLabel(title, size: 13, weight: .semibold)
+            t.frame = NSRect(x: M, y: top, width: 200, height: 18)
+            content.addSubview(t)
+            value.alignment = .right
+            value.font = NSFont.systemFont(ofSize: 12)
+            value.textColor = .secondaryLabelColor
+            value.frame = NSRect(x: M, y: top, width: CW, height: 18)
+            content.addSubview(value)
+        }
+        // 灰色小字说明
+        func caption(_ s: String, gap: CGFloat = 10) {
+            let top = take(15, gap)
+            let l = makeLabel(s, size: 11, color: .secondaryLabelColor)
+            l.frame = NSRect(x: M, y: top + 1, width: CW, height: 15)
+            content.addSubview(l)
+        }
+        func sliderRow(_ s: NSSlider, gap: CGFloat) {
+            let top = take(20, gap)
+            s.frame = NSRect(x: M, y: top, width: CW, height: 20)
+            content.addSubview(s)
+        }
+        func checkRow(_ b: NSButton, gap: CGFloat) {
+            let top = take(22, gap)
+            b.font = NSFont.systemFont(ofSize: 12)
+            b.frame = NSRect(x: M - 2, y: top, width: CW + 4, height: 22)
             content.addSubview(b)
         }
+        // 分隔线：上下各留一点气口
+        func rule(gap: CGFloat = 14) {
+            let top = take(15, gap)
+            let s = makeSeparator()
+            s.frame = NSRect(x: M, y: top + 6, width: CW, height: 1)
+            content.addSubview(s)
+        }
+        func buttonRow(_ items: [(String, Int)], gap: CGFloat) {
+            let spacing: CGFloat = 8
+            let n = CGFloat(items.count)
+            let bw = (CW - spacing * (n - 1)) / n
+            let top = take(28, gap)
+            for (i, item) in items.enumerated() {
+                let b = NSButton(title: item.0, target: self, action: #selector(quickAction(_:)))
+                b.tag = item.1
+                b.bezelStyle = .rounded
+                b.font = NSFont.systemFont(ofSize: 12)
+                b.frame = NSRect(x: M + CGFloat(i) * (bw + spacing), y: top, width: bw, height: 28)
+                quickButtons[item.1] = b
+                content.addSubview(b)
+            }
+        }
 
-        // 活动频率
-        content.addSubview(label("活动频率", NSRect(x: 20, y: 412, width: 120, height: 20), size: 13, weight: .semibold))
-        intervalValue = label("", NSRect(x: 260, y: 412, width: 140, height: 20), size: 12, color: .secondaryLabelColor)
-        intervalValue.alignment = .right
-        content.addSubview(intervalValue)
+        // ── 顶部说明
+        do {
+            let top = take(16, 16)
+            let l = makeLabel("左键拖拽搬家 · 轻点摸头 · 所有设置自动保存", size: 12, color: .secondaryLabelColor)
+            l.frame = NSRect(x: M, y: top, width: CW, height: 16)
+            content.addSubview(l)
+        }
+
+        // ── 角色大小
+        sizeValue = makeLabel("", size: 12)
+        header("角色大小", value: sizeValue)
+        sizeSlider = NSSlider(value: 240, minValue: 120, maxValue: 360, target: self, action: #selector(sizeChanged))
+        sizeSlider.isContinuous = true
+        sliderRow(sizeSlider, gap: 8)
+
+        do {
+            let presets: [(String, CGFloat)] = [("迷你", 140), ("小", 180), ("标准", 240), ("大", 320)]
+            let spacing: CGFloat = 8
+            let bw = (CW - spacing * 3) / 4
+            let top = take(26, 16)
+            for (i, p) in presets.enumerated() {
+                let b = NSButton(title: p.0, target: self, action: #selector(presetTapped(_:)))
+                b.tag = Int(p.1)
+                b.bezelStyle = .rounded
+                b.font = NSFont.systemFont(ofSize: 12)
+                b.frame = NSRect(x: M + CGFloat(i) * (bw + spacing), y: top, width: bw, height: 26)
+                content.addSubview(b)
+            }
+        }
+        rule()
+
+        // ── 桌面行为
+        intervalValue = makeLabel("", size: 12)
+        header("活动频率", value: intervalValue)
         intervalSlider = NSSlider(value: 9, minValue: 3, maxValue: 60, target: self, action: #selector(intervalChanged))
-        intervalSlider.frame = NSRect(x: 20, y: 384, width: 380, height: 22)
         intervalSlider.isContinuous = true
-        content.addSubview(intervalSlider)
-        content.addSubview(label("数值越大越安静，3 秒最活跃、60 秒基本不动", NSRect(x: 20, y: 362, width: 380, height: 18),
-                                size: 11, color: .secondaryLabelColor))
+        sliderRow(intervalSlider, gap: 4)
+        caption("数值越大越安静：3 秒最活跃，60 秒基本不动", gap: 8)
 
-        // 开关
         walkCheck = NSButton(checkboxWithTitle: "允许在桌面上走动", target: self, action: #selector(walkToggled(_:)))
-        walkCheck.frame = NSRect(x: 20, y: 326, width: 380, height: 22)
-        content.addSubview(walkCheck)
-
+        checkRow(walkCheck, gap: 3)
         talkCheck = NSButton(checkboxWithTitle: "允许自言自语（含法条）", target: self, action: #selector(talkToggled(_:)))
-        talkCheck.frame = NSRect(x: 20, y: 298, width: 380, height: 22)
-        content.addSubview(talkCheck)
-
+        checkRow(talkCheck, gap: 3)
         eyeCheck = NSButton(checkboxWithTitle: "眼神跟着鼠标走", target: self, action: #selector(eyeToggled(_:)))
-        eyeCheck.frame = NSRect(x: 20, y: 270, width: 380, height: 22)
-        content.addSubview(eyeCheck)
+        checkRow(eyeCheck, gap: 14)
+        rule()
+
+        // ── 法条台词
+        lawValue = makeLabel("", size: 12)
+        header("法条台词占比", value: lawValue)
 
         lawCheck = NSButton(checkboxWithTitle: "与 Lawlearn 联动", target: self, action: #selector(lawLinkToggled(_:)))
-        lawCheck.frame = NSRect(x: 20, y: 242, width: 380, height: 22)
-        content.addSubview(lawCheck)
-
-        // 法条占比
-        content.addSubview(label("法条台词占比", NSRect(x: 20, y: 210, width: 140, height: 20), size: 13, weight: .semibold))
-        lawValue = label("", NSRect(x: 260, y: 210, width: 140, height: 20), size: 12, color: .secondaryLabelColor)
-        lawValue.alignment = .right
-        content.addSubview(lawValue)
+        checkRow(lawCheck, gap: 4)
         lawSlider = NSSlider(value: 40, minValue: 0, maxValue: 100, target: self, action: #selector(lawChanged))
-        lawSlider.frame = NSRect(x: 20, y: 182, width: 380, height: 22)
         lawSlider.isContinuous = true
-        content.addSubview(lawSlider)
-        content.addSubview(label("连着 Lawlearn 时，说话有多大比例是念法条", NSRect(x: 20, y: 160, width: 380, height: 18),
-                                size: 11, color: .secondaryLabelColor))
+        sliderRow(lawSlider, gap: 4)
+        caption("连着 Lawlearn 时，说话有多大比例是念法条", gap: 14)
+        rule()
 
-        // 动作预览：原来右键菜单里的那三组动作挪到这儿。
-        // 三组各一个小下拉，比一整条 22 项的长菜单好点——每个最多 10 项，不用滚动。
-        content.addSubview(label("动作预览", NSRect(x: 20, y: 124, width: 80, height: 20), size: 13, weight: .semibold))
-        actionPopups = []
-        for (i, group) in PetController.actionGroups.enumerated() {
-            let pop = NSPopUpButton(frame: NSRect(x: 104 + CGFloat(i) * 98, y: 94, width: 92, height: 26),
-                                    pullsDown: false)
-            pop.bezelStyle = .rounded
-            pop.font = NSFont.systemFont(ofSize: 12)
-            pop.addItem(withTitle: group.0)
-            pop.menu?.addItem(.separator())
-            for (title, st) in group.1 {
-                let item = NSMenuItem(title: title, action: #selector(actionChosen(_:)), keyEquivalent: "")
-                item.target = self
-                item.tag = i
-                item.representedObject = st.rawValue
-                pop.menu?.addItem(item)
+        // ── 动作预览：三组各一个小下拉，每个最多 11 项，不用滚动。
+        do {
+            let top = take(19, 10)
+            let t = makeLabel("动作预览", size: 13, weight: .semibold)
+            t.frame = NSRect(x: M, y: top, width: 200, height: 18)
+            content.addSubview(t)
+
+            actionPopups = []
+            let spacing: CGFloat = 8
+            let bw = (CW - spacing * 2) / 3
+            let popTop = take(26, 6)
+            for (i, group) in PetController.actionGroups.enumerated() {
+                let pop = NSPopUpButton(frame: NSRect(x: M + CGFloat(i) * (bw + spacing), y: popTop,
+                                                      width: bw, height: 26),
+                                        pullsDown: false)
+                pop.bezelStyle = .rounded
+                pop.font = NSFont.systemFont(ofSize: 12)
+                pop.addItem(withTitle: group.0)
+                pop.menu?.addItem(.separator())
+                for (title, st) in group.1 {
+                    let item = NSMenuItem(title: title, action: #selector(actionChosen(_:)), keyEquivalent: "")
+                    item.target = self
+                    item.tag = i
+                    item.representedObject = st.rawValue
+                    pop.menu?.addItem(item)
+                }
+                // 第一项只是组名，不能点。autoenablesItems 必须关掉，
+                // 否则菜单一弹出 AppKit 会按 target 校验把 isEnabled=false 又改回 true（踩过）。
+                pop.menu?.autoenablesItems = false
+                pop.item(at: 0)?.isEnabled = false
+                pop.selectItem(at: 0)
+                actionPopups.append(pop)
+                content.addSubview(pop)
             }
-            // 第一项只是组名，不能点。autoenablesItems 必须关掉，
-            // 否则菜单一弹出 AppKit 会按 target 校验把 isEnabled=false 又改回 true（踩过）。
-            pop.menu?.autoenablesItems = false
-            pop.item(at: 0)?.isEnabled = false
-            pop.selectItem(at: 0)
-            actionPopups.append(pop)
-            content.addSubview(pop)
         }
+        caption("点两下宠物、或选「待机」就回到默认动作", gap: 14)
+        rule()
 
-        // 快捷操作
-        for (i, t) in ["让它说句话", "专注 25 分钟", "结束专注"].enumerated() {
-            let b = NSButton(title: t, target: self, action: #selector(quickAction(_:)))
-            b.tag = i
-            b.bezelStyle = .rounded
-            b.frame = NSRect(x: 20 + CGFloat(i) * 128, y: 58, width: 118, height: 28)
-            content.addSubview(b)
+        // ── 快捷操作：菜单栏原来那几项都在这儿，退出也在这一屏里
+        do {
+            let top = take(19, 10)
+            let t = makeLabel("快捷操作", size: 13, weight: .semibold)
+            t.frame = NSRect(x: M, y: top, width: 200, height: 18)
+            content.addSubview(t)
         }
+        buttonRow([("说句话", 0), ("专注 25 分钟", 1), ("结束专注", 2)], gap: 8)
+        buttonRow([("回到右下角", 3), ("显示 / 隐藏", 4), ("退出 Scheng", 5)], gap: 10)
+        caption("退出后桌宠和菜单栏天平图标一起关掉，下次从启动台再打开", gap: 0)
 
-        content.addSubview(label("设置会自动保存，下次启动沿用", NSRect(x: 20, y: 26, width: 380, height: 18),
-                                size: 11, color: .tertiaryLabelColor))
+        // 面板高度按实际内容收尾，不留多余空白
+        let h = y + 16
+        content.frame = NSRect(x: 0, y: 0, width: W, height: h)
+        panel.setContentSize(NSSize(width: W, height: h))
 
         window = panel
         syncFromController()
@@ -2000,6 +2093,7 @@ final class ConsoleWindow: NSObject, NSWindowDelegate {
 
     func show() {
         syncFromController()
+        syncVisibleButton()
         guard let w = window else { return }
         placeConsole(w)
         NSApp.activate(ignoringOtherApps: true)
@@ -2016,13 +2110,25 @@ final class ConsoleWindow: NSObject, NSWindowDelegate {
             let probe = NSRect(origin: p, size: w.frame.size).insetBy(dx: 40, dy: 40)
             if NSScreen.screens.contains(where: { $0.visibleFrame.intersects(probe) }) {
                 w.setFrameOrigin(p)
+                clampToScreen(w)
                 return
             }
         }
         let screen = controller?.window.screen ?? NSScreen.main
         if let f = screen?.visibleFrame {
             w.setFrameOrigin(NSPoint(x: f.midX - w.frame.width / 2, y: f.midY - w.frame.height / 2))
+            clampToScreen(w)
         }
+    }
+
+    /// 面板现在比原来高一截（多了一排快捷按钮），小屏上居中会顶到菜单栏或 Dock。
+    /// 这里把整块夹回可见区，只挪不缩。
+    private func clampToScreen(_ w: NSWindow) {
+        guard let vf = (w.screen ?? NSScreen.main)?.visibleFrame else { return }
+        var o = w.frame.origin
+        o.x = min(max(o.x, vf.minX), max(vf.maxX - w.frame.width, vf.minX))
+        o.y = min(max(o.y, vf.minY), max(vf.maxY - w.frame.height, vf.minY))
+        if o != w.frame.origin { w.setFrameOrigin(o) }
     }
 
     func windowDidMove(_ notification: Notification) {
@@ -2081,8 +2187,19 @@ final class ConsoleWindow: NSObject, NSWindowDelegate {
         switch sender.tag {
         case 0: controller?.say()
         case 1: controller?.startStudy()
-        default: controller?.stopStudy()
+        case 2: controller?.stopStudy()
+        case 3: controller?.goHome()
+        case 4:
+            controller?.toggleVisible()
+            syncVisibleButton()
+        default: NSApp.terminate(nil)
         }
+    }
+
+    /// 宠物藏着的时候按钮说「显示」，露着的时候说「隐藏」——比一个「显示 / 隐藏」少猜一次
+    private func syncVisibleButton() {
+        guard let b = quickButtons[4], let vis = controller?.window.isVisible else { return }
+        b.title = vis ? "隐藏 Scheng" : "显示 Scheng"
     }
 
     /// 动作预览下拉里选了一项
@@ -2103,7 +2220,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var controller: PetController!
     var statusItem: NSStatusItem!
     private var console: ConsoleWindow!
-    private var statusMenu: NSMenu!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -2226,46 +2342,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.image = icon
         statusItem.button?.imagePosition = .imageOnly
 
-        let menu = NSMenu()
-        menu.autoenablesItems = false
-        let items: [(String, Selector, String)] = [
-            ("打开控制台…", #selector(openConsole), ""),
-            ("专注 25 分钟看书", #selector(startStudy), ""),
-            ("结束专注", #selector(stopStudy), ""),
-            ("让它说句话", #selector(speak), ""),
-            ("回到右下角", #selector(goHome), ""),
-            ("显示 / 隐藏 Scheng", #selector(toggleVisible), ""),
-            ("退出", #selector(quit), "q")
-        ]
-        for (title, sel, key) in items {
-            let item = NSMenuItem(title: title, action: sel, keyEquivalent: key)
-            item.target = self
-            menu.addItem(item)
-        }
-        statusMenu = menu
-
-        // 左键点图标 -> 打开控制台；右键 -> 弹菜单
+        // 不再挂右键菜单：原来那一份（专注 / 结束专注 / 说话 / 回位 / 显示隐藏 / 退出）
+        // 现在全在控制台里，两边各维护一套还要同步置灰状态。点图标只负责开控制台。
         statusItem.button?.target = self
-        statusItem.button?.action = #selector(statusItemClicked(_:))
-        _ = statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
-    }
-
-    @objc func statusItemClicked(_ sender: NSStatusBarButton) {
-        if let ev = NSApp.currentEvent, ev.type == .rightMouseUp {
-            statusMenu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 4), in: sender)
-        } else {
-            openConsole()
-        }
+        statusItem.button?.action = #selector(openConsole)
+        _ = statusItem.button?.sendAction(on: [.leftMouseUp])
     }
 
     @objc func openConsole() { console.show() }
-
-    @objc func startStudy() { controller.startStudy() }
-    @objc func stopStudy() { controller.stopStudy() }
-    @objc func toggleVisible() { controller.toggleVisible() }
-    @objc func goHome() { controller.goHome() }
-    @objc func speak() { controller.say() }
-    @objc func quit() { NSApp.terminate(nil) }
 
     func applicationWillTerminate(_ notification: Notification) {
         // 退出前记一下位置，下次启动接着放
