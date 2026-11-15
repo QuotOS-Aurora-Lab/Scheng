@@ -6,6 +6,58 @@ import SQLite3
 struct XLog { static func write(_ msg: String) { FileHandle.standardError.write(("[XiezhiPet] " + msg + "\n").data(using: .utf8)!) } }
 func xlog(_ msg: String) { XLog.write(msg) }
 
+// MARK: - 自测（XIEZHI_CPU_LOG=1 时每 10 秒打一行自身占用）
+//
+// 外面看不清常驻桌宠到底吃多少：活动监视器只给个均值，`top`/`ps` 在受限环境
+// 里还读不到别人的进程。这里读自己的 task_info + getrusage，改性能前后用
+// 同一段代码量，数字才可比。
+//
+// 配套 XIEZHI_BENCH=1：随机行为整个不跑，固定待机，两个版本在同样负载下对比。
+
+/// 性能对照模式：不跑随机行为，固定待机
+let benchMode = ProcessInfo.processInfo.environment["XIEZHI_BENCH"] == "1"
+
+enum Perf {
+    static func cpuSeconds() -> Double {
+        var ru = rusage()
+        guard getrusage(RUSAGE_SELF, &ru) == 0 else { return 0 }
+        return Double(ru.ru_utime.tv_sec) + Double(ru.ru_utime.tv_usec) / 1e6
+            + Double(ru.ru_stime.tv_sec) + Double(ru.ru_stime.tv_usec) / 1e6
+    }
+
+    /// phys_footprint：和 Activity Monitor 的「内存」列口径一致（含压缩/映射）
+    static func footprintMB() -> Double {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+        let kr = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+        guard kr == KERN_SUCCESS else { return 0 }
+        return Double(info.phys_footprint) / 1048576
+    }
+
+    static var lastCPU: Double = cpuSeconds()
+    static var lastAt: CFAbsoluteTime = CFAbsoluteTimeGetCurrent()
+    static var peakFootprint: Double = 0
+
+    static func sample(_ tag: String) {
+        let now = CFAbsoluteTimeGetCurrent()
+        let cpu = cpuSeconds()
+        let dt = max(0.001, now - lastAt)
+        let pct = (cpu - lastCPU) / dt * 100
+        lastCPU = cpu
+        lastAt = now
+        let mb = footprintMB()
+        peakFootprint = max(peakFootprint, mb)
+        xlog(String(format: "perf[%@] cpu=%.1f%% mem=%.1fMB peak=%.1fMB avg=%.2f%%",
+                    tag, pct, mb, peakFootprint, cpu / max(1, now - startAt) * 100))
+    }
+
+    static var startAt: CFAbsoluteTime = CFAbsoluteTimeGetCurrent()
+}
+
 // MARK: - 动画资源定义
 
 enum PetState: String {
@@ -528,6 +580,28 @@ final class PetController: NSObject {
 
     private(set) var petSize: CGFloat = 240
 
+    // MARK: 几何缓存
+    //
+    // window.frame 每读一次都要往 WindowServer 要一遍（IPC），window.screen 同理。
+    // 原来 12Hz 主循环里一 tick 读四五次、走路 60Hz 里每步读两次，每秒上百次纯属白烧。
+    // 现在所有移动都走 setPetOrigin/setPetFrame，缓存跟着改；另外每 2 秒和窗口
+    // 真实值核对一次兜底（只改缓存，不动窗口）。
+    private var petFrameCache: NSRect = .zero
+    private var frameCheckedAt: CFAbsoluteTime = 0
+    /// 当前所在屏幕：命中缓存就不查 window.screen（跨屏时靠 intersects 判断自动失效）
+    private var screenCache: NSScreen?
+
+    /// 当前状态有没有对应视频（setState 时算一次，别每 tick 查字典）
+    private var stateHasVideo = false
+
+    /// 主循环频率，按「有没有人看得到」在 12 / 4 / 2 Hz 之间切
+    private var tickHz: Double = 12
+    private var occludedSince: CFAbsoluteTime = 0
+    /// 遮挡判定留滞后：切桌面/全屏动画时 occlusionState 会闪一下，不留余地会让视频反复停启
+    private var isOccluded = false
+    /// 每 tick 取一次鼠标位置，穿透判定和眼神跟随共用
+    private var mouseNow: NSPoint = .zero
+
     // 可在控制台调整的偏好
     private(set) var behaviorInterval: TimeInterval =
         max(3.0, (UserDefaults.standard.object(forKey: "behaviorInterval") as? Double) ?? 9.0)
@@ -577,6 +651,7 @@ final class PetController: NSObject {
         layer.isHidden = true
         super.init()
 
+        petFrameCache = window.frame
         restorePosition()
 
         view.controller = self
@@ -597,17 +672,8 @@ final class PetController: NSObject {
         tickTimer?.tolerance = 0.03
         RunLoop.main.add(tickTimer!, forMode: .common)
 
-        behaviorTimer = Timer.scheduledTimer(withTimeInterval: behaviorInterval, repeats: true) { [weak self] _ in
-            self?.idleBehavior()
-        }
-        behaviorTimer?.tolerance = min(2.0, behaviorInterval * 0.2)
-        RunLoop.main.add(behaviorTimer!, forMode: .common)
-
-        blinkTimer = Timer.scheduledTimer(withTimeInterval: 5.5, repeats: true) { [weak self] _ in
-            self?.randomBlink()
-        }
-        blinkTimer?.tolerance = 0.8
-        RunLoop.main.add(blinkTimer!, forMode: .common)
+        startBehaviorTimer()
+        startBlinkTimer()
 
         // 拔外接屏 / 改分辨率 / 休眠唤醒后，把窗口夹回可见区域，别留在屏幕外
         screenObservers.append(NotificationCenter.default.addObserver(
@@ -627,10 +693,45 @@ final class PetController: NSObject {
         workspaceObservers.forEach { NSWorkspace.shared.notificationCenter.removeObserver($0) }
     }
 
+    // MARK: 几何缓存（窗口坐标 / 所在屏幕）
+
+    /// 窗口矩形。读缓存，不碰 WindowServer。
+    private var petFrame: NSRect { petFrameCache }
+
+    private func setPetOrigin(_ o: NSPoint) {
+        petFrameCache.origin = o
+        window.setFrameOrigin(o)
+    }
+
+    private func setPetFrame(_ r: NSRect, display: Bool) {
+        petFrameCache = r
+        window.setFrame(r, display: display)
+    }
+
+    /// 兜底核对：每 2 秒跟窗口真实值对一次。系统全屏切换、Mission Control
+    /// 之类可能绕过我们改位置，只靠缓存会越飘越远；核对一次 2 秒才一次 IPC。
+    private func reconcileFrameIfNeeded(_ now: CFAbsoluteTime) {
+        guard now - frameCheckedAt > 2 else { return }
+        frameCheckedAt = now
+        let real = window.frame
+        if real.origin != petFrameCache.origin || real.size != petFrameCache.size {
+            petFrameCache = real
+        }
+        if let s = screenCache, !s.frame.intersects(petFrameCache) { screenCache = nil }
+    }
+
+    /// 宠物现在在哪块屏。命中缓存直接返回，跨屏后才重新问 window.screen。
+    private func currentScreen() -> NSScreen? {
+        if let s = screenCache, s.frame.intersects(petFrameCache) { return s }
+        let s = window.screen ?? NSScreen.main
+        screenCache = s
+        return s
+    }
+
     /// 屏幕参数变化或唤醒后，把窗口夹回任一屏幕的可见区域（保留用户当前位置）
     private func clampWindowToVisibleArea() {
         invalidateBoundsCache()
-        let f = window.frame
+        let f = petFrame
         guard !NSScreen.screens.isEmpty else { return }
         let screen = NSScreen.screens.first { $0.frame.intersects(f) } ?? NSScreen.main
         guard let v = screen?.visibleFrame else { return }
@@ -638,7 +739,7 @@ final class PetController: NSObject {
         o.x = max(v.minX, min(o.x, v.maxX - f.width))
         o.y = max(v.minY, min(o.y, v.maxY - f.height))
         if o.x != f.origin.x || o.y != f.origin.y {
-            window.setFrameOrigin(o)
+            setPetOrigin(o)
             // 走路中被动改了位置，锚点要跟上，否则下一步会跳回原处
             if walkTimer != nil { walkAnchorX = o.x }
         }
@@ -655,7 +756,7 @@ final class PetController: NSObject {
                 $0.visibleFrame.insetBy(dx: -petSize / 2, dy: -petSize / 2).contains(p)
             }
             if fits {
-                window.setFrameOrigin(p)
+                setPetOrigin(p)
                 return
             }
             xlog("saved origin \(p) 不在任何屏幕内，回默认位置")
@@ -666,7 +767,7 @@ final class PetController: NSObject {
     /// 记住当前位置，下次启动接着放（别每次开机都跳回右下角）
     func savePosition() {
         guard !isFlying, !isDropping, !dragging else { return }
-        let o = window.frame.origin
+        let o = petFrame.origin
         UserDefaults.standard.set(Double(o.x), forKey: "lastX")
         UserDefaults.standard.set(Double(o.y), forKey: "lastY")
     }
@@ -676,7 +777,7 @@ final class PetController: NSObject {
         guard let f = screen?.visibleFrame, f.width > 100 else { return }
         let x = max(f.minX + 20, f.maxX - petSize - 40)
         let y = max(f.minY + 20, f.minY + 40)
-        window.setFrameOrigin(NSPoint(x: x, y: y))
+        setPetOrigin(NSPoint(x: x, y: y))
     }
 
     // MARK: 状态切换
@@ -726,7 +827,9 @@ final class PetController: NSObject {
         // 有视频的状态不走 PNG 序列帧，帧表只用于计时和末帧兜底。
         // 原来整组加载（打字/翻页等 150 帧）会在主线程同步读 150 个文件。
         // 保留首帧，兼容 finishWithTurn 里 frames.first 的兜底路径。
-        if Assets.shared.videoURL(newState.rawValue) == nil {
+        // 这里算一次「这个状态有没有视频」，主循环里就不用每 tick 再查字典。
+        stateHasVideo = Assets.shared.videoURL(newState.rawValue) != nil
+        if !stateHasVideo {
             frames = Assets.shared.frames(anim)
         } else if let first = Assets.shared.image(anim.folder + "/" + (anim.files.first ?? "")) {
             frames = [first]
@@ -739,14 +842,63 @@ final class PetController: NSObject {
 
     // MARK: 帧循环
 
+    /// 主循环频率按「有没有人看得到」分档：正常 12Hz，被整块盖住 4Hz，整个藏起来 2Hz。
+    /// 切档只在跨档时重建定时器，不是每 tick 都动。
+    private func setTickHz(_ hz: Double) {
+        guard abs(hz - tickHz) > 0.01 else { return }
+        tickHz = hz
+        tickTimer?.invalidate()
+        let t = Timer(timeInterval: 1.0 / hz, repeats: true) { [weak self] _ in
+            self?.tick()
+        }
+        // 低频时给更大容差，让系统把这次唤醒并到别的定时器上
+        t.tolerance = hz > 6 ? 0.03 : 0.5
+        RunLoop.main.add(t, forMode: .common)
+        tickTimer = t
+    }
+
     private func tick() {
         let now = CFAbsoluteTimeGetCurrent()
+        reconcileFrameIfNeeded(now)
+
+        // 整块藏起来（菜单栏「隐藏」/ 别处 orderOut）：什么都不用算，连视频也别解码。
+        // 原来这种状态下 12Hz 照跑，render() 里才发现不可见再收手，空转一整天。
+        guard window.isVisible else {
+            setTickHz(2)
+            stopWalkTimer()          // 看不见还在 60Hz 挪位置，纯属白跑
+            if avPlayer?.rate != 0 { pauseVideoIfPlaying() }
+            return
+        }
+
+        // 被别的窗口整块盖住：屏幕上一个像素都看不见，解码同样是白烧。
+        // 滞后 0.6 秒再认，避开切桌面 / 全屏动画时 occlusionState 的抖动。
+        let occluded = !window.occlusionState.contains(.visible)
+        if occluded {
+            if occludedSince == 0 { occludedSince = now }
+            if now - occludedSince > 0.6 {
+                isOccluded = true
+                setTickHz(4)
+                stopWalkTimer()
+                if avPlayer?.rate != 0 { pauseVideoIfPlaying() }
+                return
+            }
+        } else {
+            occludedSince = 0
+            if isOccluded {
+                isOccluded = false
+                // 刚露出来：让媒体层重新判一次（视频恢复播放走 playVideoIfNeeded）
+            }
+            setTickHz(12)
+        }
+
+        // 鼠标位置一 tick 只取一次，穿透判定和眼神跟随共用
+        mouseNow = NSEvent.mouseLocation
 
         // 走路是否该由 60Hz 专用定时器接管，放在早退之前判断
         syncWalkTimer()
         // 透明像素上放开鼠标事件（点击穿透），气泡跟着宠物走
         updateClickThrough()
-        bubble.follow(window.frame)
+        bubble.follow(petFrame)
 
         // 专注看书：彻底静止，不做任何帧推进、位移或眼神变化
         if isFocusing {
@@ -762,11 +914,11 @@ final class PetController: NSObject {
 
         // 按住不动时也持续记位置样本，这样“停顿”能被 releaseVelocity 感知
         if dragging {
-            dragSamples.append((now, window.frame.origin))
+            dragSamples.append((now, petFrame.origin))
             while dragSamples.count > 32 { dragSamples.removeFirst() }
         }
 
-        let hasVideo = currentVideoName != nil || Assets.shared.videoURL(state.rawValue) != nil
+        let hasVideo = currentVideoName != nil || stateHasVideo
         if frames.count > 1 && !hasVideo {
             // speed 也要算进去：原来只按 fps 推进，sequence.json 里的 speed 对帧率无效
             let interval = 1.0 / max(0.1, anim.fps * max(0.1, anim.speed))
@@ -831,10 +983,10 @@ final class PetController: NSObject {
             let idx = dt < 0.05 ? 0 : (dt < 0.11 ? 1 : 2)
             return blinkImages[idx]
         }
-        if eyeTracking, let screen = window.screen {
-            let mouse = NSEvent.mouseLocation
-            let dx = mouse.x - window.frame.midX
-            let dy = abs(mouse.y - window.frame.midY)
+        if eyeTracking, let screen = currentScreen() {
+            let mouse = mouseNow
+            let dx = mouse.x - petFrame.midX
+            let dy = abs(mouse.y - petFrame.midY)
             if dy < screen.frame.height * 0.35 && abs(dx) > 55 {
                 let key = dx < 0 ? Catalog.lookRight : Catalog.lookLeft
                 return Assets.shared.image(key)
@@ -859,7 +1011,16 @@ final class PetController: NSObject {
             showStill(liftStill)
             return
         }
-        let hasVideoForState = Assets.shared.videoURL(state.rawValue) != nil
+        // 视频已经出画、也没有静图要盖：这一帧怎么显示已经定了，后面那套换层判定
+        // 每 tick 重走一遍全是空转。待机要留着——眨眼和眼神跟随都得靠它。
+        if stateHasVideo, state != .idle,
+           videoLayer?.isHidden == false, videoLayer?.isReadyForDisplay == true,
+           CFAbsoluteTimeGetCurrent() > backdropUntil {
+            if avPlayer?.rate == 0 { avPlayer?.rate = Float(max(0.1, anim.speed)) }
+            applyVideoMirror()
+            return
+        }
+        let hasVideoForState = stateHasVideo
         guard !frames.isEmpty || hasVideoForState else { return }
         // 一次性动作播完后停在末帧静图（视频层暂停会掉帧，只能用静图兜底）
         if finishedStateName == state.rawValue, let endImg = Assets.shared.endImage(state.rawValue) {
@@ -873,7 +1034,7 @@ final class PetController: NSObject {
             showStill(still)
             return
         }
-        if Assets.shared.videoURL(state.rawValue) != nil {
+        if stateHasVideo {
             playVideoIfNeeded(state.rawValue, loop: anim.loop, speed: anim.speed)
             // 换 item 后先用同状态首帧单独顶 0.28 秒（这期间视频层藏起来），
             // 只显示一层，避免静图和视频帧错位叠成「两个角色」；之后再切回视频
@@ -886,7 +1047,10 @@ final class PetController: NSObject {
             if (now < backdropUntil || !ready), let still {
                 showStill(still)
             } else {
-                if let vl = videoLayer { CATransaction.begin(); CATransaction.setDisableActions(true); vl.isHidden = false; CATransaction.commit() }
+                // 已经是显的形状就别再提交一次 CA 事务：待机时这可是每个 tick 一次
+                if let vl = videoLayer, vl.isHidden {
+                    CATransaction.begin(); CATransaction.setDisableActions(true); vl.isHidden = false; CATransaction.commit()
+                }
                 hideStill()
             }
             return
@@ -901,16 +1065,8 @@ final class PetController: NSObject {
     }
 
     private func playVideoIfNeeded(_ name: String, loop: Bool, speed: Double) {
-        guard let url = Assets.shared.videoURL(name), let player = avPlayer else {
-            xlog("video missing for \(name)")
-            return
-        }
-        if videoLayer?.isHidden != false {
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            videoLayer?.isHidden = false
-            CATransaction.commit()
-        }
+        guard let player = avPlayer else { return }
+        // 已经在放这一段：先走最省的那条路（只对一下速率/镜像），别再去解析 URL
         if currentVideoName == name && currentVideoLoop == loop {
             applyVideoMirror()
             if loop {
@@ -919,6 +1075,16 @@ final class PetController: NSObject {
                 player.rate = Float(speed)
             }
             return
+        }
+        guard let url = Assets.shared.videoURL(name) else {
+            xlog("video missing for \(name)")
+            return
+        }
+        if videoLayer?.isHidden != false {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            videoLayer?.isHidden = false
+            CATransaction.commit()
         }
         if let o = endObserver {
             NotificationCenter.default.removeObserver(o)
@@ -1055,11 +1221,11 @@ final class PetController: NSObject {
     /// 走路是否该由 60Hz 定时器接管。只在走路时创建，切走就销毁，平时不额外耗电。
     private func syncWalkTimer() {
         let shouldWalk = state == .walk && !dragging && !turning && !isFlying
-            && !isDropping && !isFocusing && !isSuspended
+            && !isDropping && !isFocusing && !isSuspended && !isOccluded
         guard shouldWalk else { stopWalkTimer(); return }
         guard walkTimer == nil else { return }
         lastWalkAt = CFAbsoluteTimeGetCurrent()
-        walkAnchorX = window.frame.origin.x
+        walkAnchorX = petFrame.origin.x
         let t = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
             self?.walkStep()
         }
@@ -1078,7 +1244,7 @@ final class PetController: NSObject {
     /// 肉眼就是「一格一格」地蹭，而且 Timer 掉一拍就变慢。
     ///
     /// 坑：NSWindow 的 frame 起点会被量化到整点（写入 1249.715，读回 1249.000），
-    /// 所以不能拿 window.frame.origin 当累加器——每步的小数都被丢掉，
+    /// 所以不能拿读回来的窗口坐标当累加器——每步的小数都被丢掉，
     /// 0.28pt 的步进会被截断成整整 1pt，实际速度变成 60pt/s。
     /// 因此另存一个带小数的 walkAnchorX，窗口只负责显示它。
     private func walkStep() {
@@ -1094,7 +1260,7 @@ final class PetController: NSObject {
         // 16.8 pt/s：和原来 12Hz × 1.4pt 的设计速度一致，只把步进节奏抹匀
         let speed: CGFloat = 16.8
         var anchor = walkAnchorX + speed * CGFloat(dt) * walkDirection
-        guard let screenFrame = (window.screen ?? NSScreen.main)?.visibleFrame else { return }
+        guard let screenFrame = (currentScreen() ?? NSScreen.main)?.visibleFrame else { return }
         if anchor < screenFrame.minX {
             anchor = screenFrame.minX
             walkDirection = 1
@@ -1105,7 +1271,7 @@ final class PetController: NSObject {
             faceRight = false
         }
         walkAnchorX = anchor
-        window.setFrameOrigin(NSPoint(x: anchor, y: window.frame.origin.y))
+        setPetOrigin(NSPoint(x: anchor, y: petFrame.origin.y))
     }
 
     // MARK: 点击穿透 / 滚轮缩放
@@ -1113,18 +1279,38 @@ final class PetController: NSObject {
     /// 素材是 320×320 的方形图，角色只占中间一块，四角是大片纯透明。
     /// 鼠标落在这类像素上时把窗口设成不吃鼠标事件，点击就能落到下面的桌面或窗口。
     /// 判定完全靠自绘的 12Hz 轮询（不依赖全局鼠标监听），失效时最差也只是某块区域点不动。
+    /// 上一次命中的条件与结论：鼠标没动、窗口没动、状态没换，结论就一样，
+    /// 不用再翻一遍位图。鼠标停在桌宠上不动时这条能省掉全部工作量。
+    private var lastHitMouse: NSPoint = NSPoint(x: -10000, y: -10000)
+    private var lastHitFrame: NSRect = .zero
+    private var lastHitState = ""
+    private var lastHitResult = false
+
     private func updateClickThrough() {
         guard !dragging, !isDropping, !isFlying, !turning, !isFocusing, window.isVisible else {
             setPassThrough(false)
             return
         }
-        let mouse = NSEvent.mouseLocation
-        let wf = window.frame
+        let mouse = mouseNow
+        let wf = petFrame
         guard wf.contains(mouse) else {
             setPassThrough(false)
+            lastHitMouse = mouse
+            lastHitFrame = wf
+            lastHitState = state.rawValue
+            lastHitResult = false
             return
         }
-        setPassThrough(isTransparent(at: NSPoint(x: mouse.x - wf.minX, y: mouse.y - wf.minY)))
+        if mouse == lastHitMouse, wf == lastHitFrame, state.rawValue == lastHitState {
+            setPassThrough(lastHitResult)
+            return
+        }
+        let result = isTransparent(at: NSPoint(x: mouse.x - wf.minX, y: mouse.y - wf.minY))
+        lastHitMouse = mouse
+        lastHitFrame = wf
+        lastHitState = state.rawValue
+        lastHitResult = result
+        setPassThrough(result)
     }
 
     private func setPassThrough(_ on: Bool) {
@@ -1135,14 +1321,14 @@ final class PetController: NSObject {
             let m = NSEvent.mouseLocation
             xlog(String(format: "passthrough=%@ mouse=(%.1f,%.1f) local=(%.1f,%.1f)",
                         on ? "on" : "off", m.x, m.y,
-                        m.x - window.frame.minX, m.y - window.frame.minY))
+                        m.x - petFrame.minX, m.y - petFrame.minY))
         }
     }
 
     /// 窗口内某点是不是全透明（坐标是窗口内的点，原点在左下）
     private func isTransparent(at p: NSPoint) -> Bool {
         guard let (data, w, h) = alphaBuffer() else { return false }
-        let size = window.frame.size
+        let size = petFrame.size
         guard size.width > 1, size.height > 1 else { return false }
         var u = p.x / size.width
         if faceRight { u = 1 - u }              // 朝右时图层是镜像的
@@ -1154,6 +1340,7 @@ final class PetController: NSObject {
     }
 
     /// 当前状态首帧的 RGBA 位图，只缓存一张（换状态才重建）。320×320 约 400KB。
+    /// 尺寸没变时复用同一块像素内存：换状态只重画，不再每回 malloc 400KB。
     private func alphaBuffer() -> (UnsafeMutablePointer<UInt8>, Int, Int)? {
         let key = state.rawValue
         if alphaRepKey == key, let rep = alphaRep, let d = rep.bitmapData {
@@ -1164,10 +1351,17 @@ final class PetController: NSObject {
         guard let img = Assets.shared.image(still) ?? Assets.shared.image(fallback),
               let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
         let w = cg.width, h = cg.height
-        guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: w, pixelsHigh: h,
-                                         bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
-                                         isPlanar: false, colorSpaceName: .deviceRGB,
-                                         bytesPerRow: w * 4, bitsPerPixel: 32) else { return nil }
+        let rep: NSBitmapImageRep
+        if let old = alphaRep, old.pixelsWide == w, old.pixelsHigh == h, old.bitmapData != nil {
+            rep = old
+        } else if let fresh = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: w, pixelsHigh: h,
+                                               bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                               isPlanar: false, colorSpaceName: .deviceRGB,
+                                               bytesPerRow: w * 4, bitsPerPixel: 32) {
+            rep = fresh
+        } else {
+            return nil
+        }
         NSGraphicsContext.saveGraphicsState()
         if let ctx = NSGraphicsContext(bitmapImageRep: rep) {
             NSGraphicsContext.current = ctx
@@ -1184,6 +1378,7 @@ final class PetController: NSObject {
     // MARK: 随机行为
 
     private func idleBehavior() {
+        if benchMode { return }
         manualAction = false
         if isSuspended { return }
         if CFAbsoluteTimeGetCurrent() < manualHoldUntil { return }
@@ -1247,7 +1442,7 @@ final class PetController: NSObject {
         let token = talkToken
         Lines.next { [weak self] text in
             guard let self, self.talkToken == token else { return }
-            self.showBubble(text, above: self.window.frame)
+            self.showBubble(text, above: self.petFrame)
         }
     }
 
@@ -1276,14 +1471,14 @@ final class PetController: NSObject {
         let dy = mouse.y - lastMousePoint.y
         dragDistance += abs(dx) + abs(dy)
         lastMousePoint = mouse
-        var origin = window.frame.origin
+        var origin = petFrame.origin
         origin.x += dx
         origin.y += dy
-        window.setFrameOrigin(origin)
-        bubble.follow(window.frame)
+        setPetOrigin(origin)
+        bubble.follow(petFrame)
 
         // 记录最近一小段位移，松手时换算成甩出速度
-        dragSamples.append((CFAbsoluteTimeGetCurrent(), window.frame.origin))
+        dragSamples.append((CFAbsoluteTimeGetCurrent(), petFrame.origin))
         while dragSamples.count > 32 { dragSamples.removeFirst() }
     }
 
@@ -1294,11 +1489,11 @@ final class PetController: NSObject {
             pat()
             return
         }
-        if let f = (window.screen ?? NSScreen.main)?.visibleFrame {
-            var origin = window.frame.origin
+        if let f = (currentScreen() ?? NSScreen.main)?.visibleFrame {
+            var origin = petFrame.origin
             origin.y = max(f.minY, min(origin.y, f.maxY - petSize))
             origin.x = max(f.minX, min(origin.x, f.maxX - petSize))
-            window.setFrameOrigin(origin)
+            setPetOrigin(origin)
         }
         savePosition()
         // 甩得够快就进入皮球模式
@@ -1310,9 +1505,9 @@ final class PetController: NSObject {
             return
         }
         // 没甩：在空中就立刻缓落回地面，别停在半空
-        let ground = (window.screen ?? NSScreen.main)?.visibleFrame.minY ?? 0
+        let ground = (currentScreen() ?? NSScreen.main)?.visibleFrame.minY ?? 0
         isSuspended = false
-        if window.frame.minY > ground + 40 {
+        if petFrame.minY > ground + 40 {
             if state != .hide && state != .hideWait { setState(.lift) }
             dropToGround()
         } else {
@@ -1441,12 +1636,12 @@ final class PetController: NSObject {
         isSuspended = false
         view.contentOffset = .zero
         view.needsDisplay = true
-        guard let screen = window.screen ?? NSScreen.main else {
+        guard let screen = currentScreen() ?? NSScreen.main else {
             isDropping = false
             return
         }
         let ground = screen.visibleFrame.minY
-        let startY = window.frame.minY
+        let startY = petFrame.minY
         if ground >= startY - 1 {
             isDropping = false
             setState(.land)
@@ -1461,9 +1656,9 @@ final class PetController: NSObject {
             guard let self else { timer.invalidate(); return }
             let p = min(1.0, (CFAbsoluteTimeGetCurrent() - t0) / duration)
             let eased = CGFloat(p * p)
-            var f = self.window.frame
+            var f = self.petFrame
             f.origin.y = startY + (ground - startY) * eased
-            self.window.setFrameOrigin(f.origin)
+            self.setPetOrigin(f.origin)
             self.render()
             if p >= 1.0 {
                 timer.invalidate()
@@ -1486,7 +1681,7 @@ final class PetController: NSObject {
             return c
         }
         let screens = NSScreen.screens
-        let center = NSPoint(x: window.frame.midX, y: window.frame.midY)
+        let center = NSPoint(x: petFrame.midX, y: petFrame.midY)
         let current = screens.first { $0.frame.contains(center) }
             ?? screens.min { hypot($0.frame.midX - center.x, $0.frame.midY - center.y)
                 < hypot($1.frame.midX - center.x, $1.frame.midY - center.y) }
@@ -1512,7 +1707,7 @@ final class PetController: NSObject {
         lastPhysicsAt = flyStartedAt
         velX = vx
         velY = vy
-        flyScreen = window.screen ?? NSScreen.main
+        flyScreen = currentScreen() ?? NSScreen.main
         flyTraceCount = 0
         if ProcessInfo.processInfo.environment["XIEZHI_FLY_TRACE"] == "1" {
             flyTraceFile = nil
@@ -1548,11 +1743,11 @@ final class PetController: NSObject {
 
         velY -= gravity * dt
         let b = playBounds()
-        let onGroundNow = window.frame.minY <= b.minY + 0.5
+        let onGroundNow = petFrame.minY <= b.minY + 0.5
         // 空中几乎无阻力，贴地滚动时摩擦明显，避免横着滑很久
         velX *= onGroundNow ? 0.90 : 0.999
 
-        var origin = window.frame.origin
+        var origin = petFrame.origin
         origin.x += velX * dt
         origin.y += velY * dt
 
@@ -1579,7 +1774,7 @@ final class PetController: NSObject {
                 bounced = true
             }
         }
-        window.setFrameOrigin(origin)
+        setPetOrigin(origin)
         if abs(velX) > 60 { faceRight = velX > 0 }
 
         if let fh = flyTraceFile {
@@ -1606,14 +1801,14 @@ final class PetController: NSObject {
         isFlying = false
         if landed {
             let b = playBounds()
-            var origin = window.frame.origin
+            var origin = petFrame.origin
             origin.y = max(b.minY, min(origin.y, b.maxY - petSize))
             origin.x = max(b.minX, min(origin.x, b.maxX - petSize))
-            window.setFrameOrigin(origin)
+            setPetOrigin(origin)
             isSuspended = false
             faceRight = false
             setState(.land)
-            xlog(String(format: "fly end at (%.0f, %.0f) after %.2fs", window.frame.minX, window.frame.minY,
+            xlog(String(format: "fly end at (%.0f, %.0f) after %.2fs", petFrame.minX, petFrame.minY,
                         CFAbsoluteTimeGetCurrent() - flyStartedAt))
         } else if !silent {
             setState(.idle)
@@ -1654,10 +1849,10 @@ final class PetController: NSObject {
     }
 
     /// 测试用：直接把角色抬到半空并当成“松手后悬停”
-    func testSuspend() {        guard let screen = window.screen ?? NSScreen.main else { return }
-        var f = window.frame
+    func testSuspend() {        guard let screen = currentScreen() ?? NSScreen.main else { return }
+        var f = petFrame
         f.origin.y = screen.visibleFrame.minY + 300
-        window.setFrameOrigin(f.origin)
+        setPetOrigin(f.origin)
         isSuspended = false
         setState(.lift)
         xlog("[XiezhiPet] test suspend at y=\(Int(f.origin.y))")
@@ -1674,10 +1869,10 @@ final class PetController: NSObject {
 
     func resize(to size: CGFloat) {
         let clamped = max(120, min(360, size))
-        let old = window.frame
+        let old = petFrame
         petSize = clamped
         let rect = NSRect(x: old.midX - clamped / 2, y: old.minY, width: clamped, height: clamped)
-        window.setFrame(rect, display: true)
+        setPetFrame(rect, display: true)
         view.frame = NSRect(x: 0, y: 0, width: clamped, height: clamped)
         videoLayer?.frame = NSRect(x: 0, y: 0, width: clamped, height: clamped)
         stillLayer?.frame = NSRect(x: 0, y: 0, width: clamped, height: clamped)   // 静态层不跟着改尺寸，切到静图时大小会跳
@@ -1691,11 +1886,8 @@ final class PetController: NSObject {
         behaviorInterval = max(3, min(120, seconds))
         UserDefaults.standard.set(behaviorInterval, forKey: "behaviorInterval")
         behaviorTimer?.invalidate()
-        behaviorTimer = Timer.scheduledTimer(withTimeInterval: behaviorInterval, repeats: true) { [weak self] _ in
-            self?.idleBehavior()
-        }
-        behaviorTimer?.tolerance = min(2.0, behaviorInterval * 0.2)
-        if let t = behaviorTimer { RunLoop.main.add(t, forMode: .common) }
+        behaviorTimer = nil
+        startBehaviorTimer()
     }
 
     func setAllowWalk(_ v: Bool) {
@@ -1719,11 +1911,11 @@ final class PetController: NSObject {
     }
 
     private func clampToScreen() {
-        guard let f = (window.screen ?? NSScreen.main)?.visibleFrame else { return }
-        var o = window.frame.origin
+        guard let f = (currentScreen() ?? NSScreen.main)?.visibleFrame else { return }
+        var o = petFrame.origin
         o.x = max(f.minX, min(o.x, f.maxX - petSize))
         o.y = max(f.minY, min(o.y, f.maxY - petSize))
-        window.setFrameOrigin(o)
+        setPetOrigin(o)
     }
 
     // MARK: 动作预览
@@ -1769,20 +1961,20 @@ final class PetController: NSObject {
         lastInteractionAt = CFAbsoluteTimeGetCurrent()
         moveToDefaultPosition()
         savePosition()
-        showBubble("回老位置啦", above: window.frame)
+        showBubble("回老位置啦", above: petFrame)
     }
 
     func startStudy() {
         // 已经在专注就别再挂一个 25 分钟定时器，否则多份回调同时到点会来回切状态
         guard !isFocusing else {
-            showBubble("已经在专注啦", above: window.frame)
+            showBubble("已经在专注啦", above: petFrame)
             return
         }
         isFocusing = true
         studySession += 1
         let session = studySession
         setState(.study)
-        showBubble(Lines.focusStart, above: window.frame)
+        showBubble(Lines.focusStart, above: petFrame)
         DispatchQueue.main.asyncAfter(deadline: .now() + 25 * 60) { [weak self] in
             guard let self, self.studySession == session else { return }
             self.isFocusing = false
@@ -1790,7 +1982,7 @@ final class PetController: NSObject {
             // 到点得让人听得见：宠物可能被别的窗口挡住，光弹气泡容易被漏看
             if focusChime == nil { focusChime = NSSound(named: "Glass") }
             focusChime?.play()
-            self.showBubble(Lines.focusEnd, above: self.window.frame)
+            self.showBubble(Lines.focusEnd, above: self.petFrame)
             DispatchQueue.main.asyncAfter(deadline: .now() + 5 * 60) { [weak self] in
                 guard let self, self.state == .play else { return }
                 self.setState(.idle)
@@ -1807,7 +1999,43 @@ final class PetController: NSObject {
     }
 
     func toggleVisible() {
-        if window.isVisible { window.orderOut(nil) } else { window.orderFrontRegardless() }
+        if window.isVisible {
+            window.orderOut(nil)
+            // 藏起来以后眨眼和随机行为都没意义，定时器一起停掉，减少无谓唤醒；
+            // 重新显示时再挂回去（频率与容差沿用原来的口径）
+            blinkTimer?.invalidate()
+            blinkTimer = nil
+            behaviorTimer?.invalidate()
+            behaviorTimer = nil
+            stopWalkTimer()
+            pauseVideoIfPlaying()
+        } else {
+            window.orderFrontRegardless()
+            startBlinkTimer()
+            startBehaviorTimer()
+            tickHz = 0          // 逼下一拍 setTickHz 把 12Hz 挂回来
+            tick()
+        }
+    }
+
+    private func startBlinkTimer() {
+        guard blinkTimer == nil else { return }
+        let t = Timer.scheduledTimer(withTimeInterval: 5.5, repeats: true) { [weak self] _ in
+            self?.randomBlink()
+        }
+        t.tolerance = 0.8
+        RunLoop.main.add(t, forMode: .common)
+        blinkTimer = t
+    }
+
+    private func startBehaviorTimer() {
+        guard behaviorTimer == nil else { return }
+        let t = Timer.scheduledTimer(withTimeInterval: behaviorInterval, repeats: true) { [weak self] _ in
+            self?.idleBehavior()
+        }
+        t.tolerance = min(2.0, behaviorInterval * 0.2)
+        RunLoop.main.add(t, forMode: .common)
+        behaviorTimer = t
     }
 
     func testFly() {
@@ -2228,6 +2456,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         console = ConsoleWindow(controller: controller)
         setupMenuBar()
         // 调试用：XIEZHI_AUTO_SAY=1 时启动 2 秒后自动说一句（便于验收气泡排版）
+        if ProcessInfo.processInfo.environment["XIEZHI_CPU_LOG"] == "1" {
+            Perf.startAt = CFAbsoluteTimeGetCurrent()
+            Perf.lastCPU = Perf.cpuSeconds()
+            Perf.lastAt = Perf.startAt
+            let t = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { _ in Perf.sample("run") }
+            RunLoop.main.add(t, forMode: .common)
+        }
         if ProcessInfo.processInfo.environment["XIEZHI_OPEN_CONSOLE"] == "1" {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
                 self?.console.show()
